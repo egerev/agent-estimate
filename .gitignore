@@ -1,0 +1,4 @@
+*.pyc
+.claude/data/
+.estimate/
+__pycache__/

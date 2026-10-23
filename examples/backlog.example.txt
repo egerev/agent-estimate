@@ -1,0 +1,12 @@
+# Synthetic example backlog: one item per line, "<SP> <title>" (or "<title> | <SP>").
+# Items at 13 SP or more must be split before work; they are flagged.
+3 Export search results as CSV
+5 Add retry with backoff to the webhook sender
+2 Fix timezone in the daily digest header
+8 Second storage backend behind the existing interface
+1 Rename the confusing config flag, keep the old name as an alias
+5 Paginate the admin list endpoints
+3 Rate-limit login attempts per IP
+13 Offline mode for the mobile client
+2 Flaky test: stabilize the clock in scheduler tests
+5 Audit log for permission changes

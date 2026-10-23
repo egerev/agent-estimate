@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in estimate or its skills does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please redact paths, repo names and card titles. Do not paste `.estimate/` files or excerpts
+        of Claude Code or Codex logs: they can contain private code and prompts.
+        Security problems go to a private advisory (see SECURITY.md), not here.
+  - type: input
+    id: version
+    attributes:
+      label: estimate --version
+      placeholder: 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and Python version
+      placeholder: macOS 15, Python 3.12
+    validations:
+      required: true
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Agent harness
+      multiple: true
+      options: [Claude Code, Codex, Other / none]
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and output
+      description: The command you ran and what it printed, redacted.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true

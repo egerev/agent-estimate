@@ -1,0 +1,20 @@
+{
+  "requirements": [
+    {"id": "00000000-0000-4000-8000-000000000001", "productId": "p-1", "title": "Audit log epic", "content": "Container.",
+     "status": "Backlog", "priority": "High", "type": "Epic", "childrenCount": 2, "seqNum": 1},
+    {"id": "00000000-0000-4000-8000-000000000002", "productId": "p-1", "parentId": "00000000-0000-4000-8000-000000000001",
+     "title": "Audit log table | write path", "content": "Value: 5. Effort: 3. Score: 1.67.",
+     "status": "Backlog", "priority": "Medium", "type": "User Story", "childrenCount": 0, "seqNum": 2},
+    {"id": "00000000-0000-4000-8000-000000000003", "productId": "p-1", "parentId": "00000000-0000-4000-8000-000000000001",
+     "title": "Audit log viewer", "content": "Problem: no viewer.\nDepends on: 00000000-0000-4000-8000-000000000002 and BL-33.\nValue: 3",
+     "status": "Review", "priority": "Not set", "type": "User Story", "childrenCount": 0, "seqNum": 3},
+    {"id": "00000000-0000-4000-8000-000000000004", "productId": "p-1", "title": "Export to CSV",
+     "content": "Value: 3. Effort: 22 (sum of the children). Depends on: 00000000-0000-4000-8000-000000000005",
+     "status": "Backlog", "priority": "Low", "type": "Feature", "childrenCount": 0, "seqNum": 4},
+    {"id": "00000000-0000-4000-8000-000000000005", "productId": "p-1", "title": "Login", "content": "Value: 8. Effort: 2.",
+     "status": "Active", "priority": "High", "type": "Feature", "childrenCount": 0, "seqNum": 5},
+    {"id": "00000000-0000-4000-8000-000000000006", "productId": "p-1", "title": "Old import", "content": "",
+     "status": "Done", "priority": "Low", "type": "User Story", "childrenCount": 0, "seqNum": 6}
+  ],
+  "pagination": {"nextPageToken": "", "totalCount": 6}
+}
