@@ -166,7 +166,7 @@ class SampleAudit(unittest.TestCase):
             self.assertIn('calibration n=6 of 7 sized PRs', out); self.assertIn('1 merged before the 14-day window', out)
             out, err = cli(store, 'forecast', '--sp', '2', now=now)
             self.assertEqual(len(out.strip().splitlines()), 1)     # the quote line stays one line
-            self.assertIn('#99', err)
+            self.assertIn('1 outside the window: see `estimate doctor`', err)   # one summary line; the list is in doctor
             E.Store(tmp).write_json('retro-packet.json', {'repo': 'owner/repo', 'prs': []})
             with patch.object(E, 'measure', return_value={}):
                 sizes = Path(tmp) / 's.json'; sizes.write_text('{}')
@@ -198,7 +198,7 @@ class ReviewRegressions(unittest.TestCase):
             now = T0 + timedelta(days=60)
             out, err = cli(store, 'forecast', '--sp', '2', now=now)
             self.assertIn('no settled history yet', out)
-            self.assertIn('calibration n=0 of 3 sized PRs', err); self.assertIn('merged before the 14-day window', err)
+            self.assertIn('calibration n=0 of 3 sized PRs; 3 outside the window', err)
             backlog = Path(tmp) / 'b.md'; backlog.write_text('| id | title | effort |\n|---|---|---|\n| 1 | a | 2 |\n')
             out, _ = cli(store, 'forecast', '--backlog', str(backlog), now=now)
             self.assertIn('calibration n=0 of 3 sized PRs', out)

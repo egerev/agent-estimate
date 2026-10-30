@@ -109,7 +109,7 @@ def main():
         page.click('label[for=tb-t1]')
         check(page.locator('.v.t1a3 .mark.lo').count() == 0, 'day boxes carry no 5-hour reset mark')
         page.click('label[for=tb-t0]')
-        kv = page.locator('.kv').inner_text()
+        kv = page.locator('.grid .kv').first.inner_text()
         check('Subscriptions' in kv and '$400/mo' in kv and 'Claude Max + ChatGPT Pro' in kv, 'subscriptions row once plans are set')
         check('Today' in kv and '7 days' in kv and 'partly unpriced' in kv, 'burn rows show today, 7 days and unpriced tokens')
         check(all(x in kv for x in ('Pace', 'Agent work per SP', '$ per SP', 'Tokens per SP', '24 PRs')), 'rates carry sample sizes')
@@ -117,7 +117,7 @@ def main():
         page = open_page(browser, out / 'no-windows.html', errors)
         check(page.locator('text=no snapshot yet').count() == 3 and page.locator('.strip .w .big').count() == 0,
               'without snapshots the window cards say "no snapshot yet", never a guess')
-        check('Subscriptions' not in page.locator('.kv').inner_text() and page.locator('.mark.lo').count() == 0,
+        check('Subscriptions' not in page.locator('.grid .kv').first.inner_text() and page.locator('.mark.lo').count() == 0,
               'without plans or snapshots: no subscriptions row, no reset mark')
         page = open_page(browser, out / 'dashboard.html', errors, scheme='light')
         bg = page.evaluate('getComputedStyle(document.body).backgroundColor')
@@ -131,7 +131,7 @@ def main():
         check(page.locator('h1').inner_text() == '2cards need sizing', 'only unsized cards: asks for sizing, not for a backlog')
         check(page.locator('.list li.none').count() == 2, 'only unsized cards: they are listed')
         page = open_page(browser, out / 'no-cost.html', errors)
-        check('not enough data' in page.locator('.kv').inner_text(), 'no cost history: says so quietly')
+        check('not enough data' in page.locator('.grid .kv').first.inner_text(), 'no cost history: says so quietly')
         page = open_page(browser, out / 'no-metrics.html', errors, 390, 844)
         check(page.evaluate('document.documentElement.scrollWidth') <= 390, 'no hours or cost at 390 px: no overflow')
         page = open_page(browser, out / 'no-history.html', errors)
@@ -139,7 +139,7 @@ def main():
         check(page.locator('text=No history yet').is_visible(), 'no history: says why there is no planner')
         check(page.locator('.list li').count() == 10, 'no history: backlog list still renders')
         page = open_page(browser, out / 'few-prs.html', errors)
-        check('min–max' in page.locator('.kv').inner_text(), 'under 5 PRs: rates are min–max ranges')
+        check('min–max' in page.locator('.grid .kv').first.inner_text(), 'under 5 PRs: rates are min–max ranges')
         page = open_page(browser, out / 'worst-case.html', errors)
         check(page.evaluate('document.documentElement.scrollWidth') <= 1280, 'worst case: no horizontal page overflow')
         check(page.locator('script').count() == 0, 'worst case: titles are escaped (no <script>)')

@@ -1,6 +1,82 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+### Changed
+- **`dashboard --all` reads the agent logs once**: every project reuses one Claude and Codex scan (prices are
+  applied per project), so `--all` takes about as long as one dashboard instead of one per project. All projects
+  of a run share one clock.
+- **Usage by repo**: a session in a folder with no git repo is counted under its top folder below `$HOME`, named
+  as a folder (`~/notes (folder)`), so project directories under one folder pool; a path outside `$HOME` keeps
+  its path plus `(folder)`.
+- **`gpt-6-sol` price**: Codex transcripts name `gpt-6-sol` (about 210 M tokens in 30 days were unpriced). Added at
+  OpenAI's standard list price (input $2, cached $0.20, output $10 per M; above 272K input tokens $4 / $0.40 /
+  $15), from https://developers.openai.com/api/docs/pricing, checked 2026-10-26 together with `gpt-6.1-sol` and
+  `gpt-6-astra`. Run `estimate record --refresh` to price past PRs that used it.
+
+### Added
+- **`estimate usage [--days 7|30|90] [--json] [--no-labels]` and a Usage section on the dashboard** (30 or 90
+  days, switched without a script): $ and tokens per repo (a session's cwd maps to its git remote, so worktrees
+  pool; a removed worktree follows its siblings, the registry or its pr-links), the top 10 sessions by $ with
+  date, agent, model and a 60-character first-line label (`--no-labels` or `"session_labels": false` in
+  `config.json` hides it), cache tiles (processed tokens, cached input share, uncached input, output, cache
+  savings in $), daily $ by agent and by model as static SVG bars, parallel sessions (median and p80 over active
+  15-minute slots, and "you usually run ~N" next to the planner's agent count), merged PRs per session, and a
+  model table with $, share, tokens and an approximate flag for a model without a price.
+- **Data dir discovery**: without `--dir` / `$ESTIMATE_DIR`, `estimate` uses the nearest `.estimate/` above the
+  current directory (with a ledger, history or config), else the entry for the repo's git remote in
+  `~/.config/agent-estimate/projects.json` (`$ESTIMATE_REGISTRY`), so every worktree and agent of a repo finds
+  the same data. `estimate setup` writes the entry; `estimate link --dir D [--repo R] [--claude-project-dir P]`
+  sets it by hand. `--repo` now defaults from the git remote before asking `gh`.
+- **`estimate doctor`**: which data dir, repo and Claude transcript dirs were resolved and from where, ledger
+  and history counts, calibration n, `gh` auth, the status-line hook, and the full sample audit. Writes nothing.
+- **`estimate plan`**: critical-chain forecast of the backlog. A seeded Monte Carlo of a list scheduler with
+  K agents gives p50/p80 finish dates per agent count, what one more agent saves, the max useful agent count,
+  the project buffer (p80 − p50), the critical chain, waves with dates, and blocked cards. Card time comes from
+  the repo's merged PRs (work rate per SP, scaled to the calendar pace, plus the merge wait). `--agents`,
+  `--top`, `--json`. Unsized cards are skipped with a warning; unknown or cyclic dependencies are excluded and
+  named; maybe-done cards in scope are counted.
+- **Lanes**: an optional `lane` column with caps (`open`, `merging`) from a `## Lanes` section of the backlog
+  file or `lanes` in `.estimate/config.json` (config wins).
+- **Ahead** section on the dashboard: the next 20 cards in agent lanes for the selected agent count, the
+  critical chain highlighted, waiting cards dimmed, p50 marker and p80 buffer.
+- **Depends from Tiden card text**: `backlog pull` fills an empty depends cell from the card's `Depends on`
+  line, now also by key (KEY-44) or product code and number (ACME-225; the code comes from `tiden product
+  list`). A hand-filled cell, or `-` for none, is never overwritten.
+- **Wall clock lines** in `forecast --backlog`: 1, 2, 3 and 5 agents in parallel, never shorter than the
+  longest dependency chain.
+- **`record --all`, `dashboard --all`**: every project in `~/.config/agent-estimate/projects.json`, one line
+  each (settled, new PRs, calibration n, pre-work n); a failing project is named and the loop goes on; the
+  exit status is non-zero only when every project failed. For a nightly job.
+- **`no PR` estimates**: `record` marks a branch estimate whose branch has no open or merged PR after 7 days
+  (`--no-pr-days N`, 0 never). It stays in the ledger, leaves the pending list and the audit, is listed by
+  `estimate doctor`, and a PR merged later still settles it.
+
+### Changed
+- The dashboard reads 90 days of agent logs once (the burn rows still count today and 7 days), so it takes a
+  few seconds longer on large log folders.
+- **Pre-work timing**: agent activity at most 10 minutes before the estimate, with no commit or PR before it,
+  is the sizing itself and no longer moves `start_at` ahead of the estimate, so the estimate counts as made
+  before work. Run `estimate record --refresh` once to remeasure settled PRs.
+- **Wider, calibrated intervals**: p20–p80 quotes are widened to the leave-one-out forecast error of the
+  window (the p50 is unchanged), so they hold about 60% of new tasks instead of about 45%.
+- **`--claude-project-dir` checkouts**: a checkout path is mapped to its transcript directory under
+  `~/.claude/projects`; `link` and `doctor` warn about a path that is neither.
+- **Re-pull keeps more**: `backlog pull` keeps a `lane` column and any sections after the table (`## Lanes`).
+  An empty depends cell is no longer kept empty: it takes the card's `Depends on` line; write `-` for none.
+- **Empty data dir stops**: `forecast` (except logging with `--task`), `forecast --backlog` and `dashboard`
+  exit non-zero with one message naming the dir and the 3 ways to point elsewhere, instead of n=0 numbers.
+- **Hours wording**: backlog hours read "agent active time, summed (one agent working serially; not wall
+  clock)"; the dashboard says the same and labels the "All … SP" rows as wall clock.
+- **Quieter forecasts**: the sample audit (PRs without agent logs, out of the window, pending estimates) is
+  one summary line in `forecast`; the full list is in `estimate doctor` and `estimate record`.
+- **Fresh repo nudge** also shows on a dashboard with no backlog yet.
+- Skills `estimate-task` and `estimate-backlog` start with `estimate doctor` when unsure of the data dir.
+
+### Fixed
+- **Removed worktrees**: a Claude session whose `cwd` was removed after merge (a worktree) is attributed again
+  when a session of the same transcript directory in that `cwd` was identified; remeasuring after cleanup
+  used to drop it and undercount active hours and dollars.
 
 ## 0.3.0
 

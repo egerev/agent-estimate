@@ -147,7 +147,7 @@ class Setup(unittest.TestCase):
         subprocess.run(['git', 'init', '-q', str(self.proj)], check=True)
         cwd = os.getcwd(); os.chdir(self.proj); self.addCleanup(os.chdir, cwd)
         env = patch.dict(os.environ); env.start(); self.addCleanup(env.stop)
-        os.environ.pop('ESTIMATE_DIR', None)
+        os.environ.pop('ESTIMATE_DIR', None); os.environ['ESTIMATE_REGISTRY'] = str(Path(self.tmp.name) / 'projects.json')
 
     def config(self):
         return json.loads((self.proj / '.estimate' / 'config.json').read_text())

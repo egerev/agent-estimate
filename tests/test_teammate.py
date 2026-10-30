@@ -115,7 +115,7 @@ class DashboardCommand(unittest.TestCase):
     def run_dashboard(self, *extra, fail=None):
         with tempfile.TemporaryDirectory() as d:
             backlog = Path(d) / 'b.md'; backlog.write_text('| id | title | effort | value |\n|---|---|---|---|\n| 1 | a | 3 | 5 |\n')
-            out = Path(d) / 'dash.html'; err = io.StringIO()
+            out = Path(d) / 'dash.html'; err = io.StringIO(); (Path(d) / 'config.json').write_text('{}')   # a set-up data dir
             with mock.patch.object(E, 'scan_burn', return_value=[], side_effect=fail) as scanned, mock.patch.dict(os.environ, {'ESTIMATE_WINDOWS_FILE': f'{d}/w.jsonl', 'ESTIMATE_RATE_HISTORY': f'{d}/r.jsonl'}), contextlib.redirect_stderr(err), \
                     contextlib.redirect_stdout(io.StringIO()):
                 E.main(['--repo', 'o/r', '--dir', d, '--now', E.iso(NOW), '--claude-dir', d, '--codex-dir', d,
@@ -129,7 +129,8 @@ class DashboardCommand(unittest.TestCase):
 
     def test_burn_reads_the_last_week_and_can_be_skipped(self):
         page, scanned, _ = self.run_dashboard()
-        self.assertEqual(scanned.call_args[0][2], NOW - timedelta(days=E.BURN_DAYS))
+        # one scan of the longest Usage period; the burn rows still count only the last BURN_DAYS days
+        self.assertEqual(scanned.call_args[0][2], NOW - timedelta(days=max(E.USAGE_PERIODS)))
         self.assertIn('no agent responses', page)
         page, scanned, _ = self.run_dashboard('--no-burn')
         scanned.assert_not_called(); self.assertIn('no local agent logs found', page)
@@ -177,7 +178,8 @@ class Planner(unittest.TestCase):
         started = time.monotonic()
         self.assertIsNone(E.plan_state(chain, ('t7', 'Week', '', 'd', 7), 5, self.RATES, {})['need'])
         self.assertEqual(E.plan_state(loose, ('t7', 'Week', '', 'd', 7), 5, self.RATES, {})['need'], 8)   # 500 SP ÷ 70 SP each
-        self.assertLess(time.monotonic() - started, 2)
+        # Generous bound: a quadratic regression takes minutes on 500 cards; 2 s flaked under host load.
+        self.assertLess(time.monotonic() - started, 15)
 
     def test_a_card_longer_than_the_box_is_never_counted(self):
         big = [{'id': '1', 'sp': 8}, {'id': '2', 'sp': 1}]

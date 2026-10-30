@@ -55,6 +55,31 @@ def burn(seed=5):
     return E.burn_report(sorted(recs), NOW, timezone.utc)
 
 
+def usage(seed=7, labels=True):
+    """Synthetic sessions over 90 days in four repos: Claude Code and Codex, parallel workers, one unpriced model."""
+    rnd = random.Random(seed); recs = []; meta = {}; repos = {}
+    names = ('example/shop', 'example/shop', 'example/blog', 'example/infra', '~/notes')
+    tasks = ('Add retry with backoff to the webhook sender', 'Review the diff on this branch', 'Paginate the admin list endpoints',
+             'Fix timezone in the daily digest header', 'Audit log viewer in the admin panel', '/review')
+    models = (('claude-code', 'claude-opus-5-5'), ('claude-code', 'claude-sonnet-5-5'), ('codex', 'gpt-6.1-sol'), ('codex', 'gpt-6-sol'))
+    for k in range(260):
+        day = rnd.choice(range(90)) if k % 3 else rnd.choice(range(30))
+        start = NOW - timedelta(days=day, hours=rnd.uniform(0, 10)); sid = f's{k}'
+        agent, model = models[0 if k % 5 < 2 else 1 if k % 5 == 2 else 2 if k % 7 else 3]
+        meta[sid] = {'label': tasks[k % len(tasks)] if labels else None}; repos[sid] = names[k % len(names)]
+        for n in range(rnd.randint(10, 80)):
+            ts = start + timedelta(minutes=n * rnd.uniform(1, 4))
+            if ts > NOW: break
+            u = E.normalize_usage({'input_tokens': rnd.randint(5, 400), 'output_tokens': rnd.randint(200, 3000),
+                                   'cache_read_input_tokens': rnd.randint(40_000, 160_000), 'cache_creation_input_tokens': rnd.randint(0, 6000)})
+            fam = E.model_family(model, E.DEFAULT_PRICES)
+            usd = E.message_cost(u, E.DEFAULT_PRICES[fam]) if fam else None
+            recs.append((ts, agent, model, u['total_tokens'], usd, (sid,), (sid, n), u, sid))
+    merged = {'example/shop': [NOW - timedelta(hours=7 * k) for k in range(120)], 'example/blog': [NOW - timedelta(days=2 * k) for k in range(20)]}
+    return {d: E.usage_report(sorted(recs), meta, repos, NOW, d, E.DEFAULT_PRICES, timezone.utc, labels=labels, merged=merged)
+            for d in E.USAGE_PERIODS}
+
+
 def windows():
     """A fresh Claude snapshot with reset times (the 5-hour window resets in 2 h 20 min), a Codex week and window prices."""
     ts = NOW - timedelta(minutes=3)
@@ -68,12 +93,12 @@ def windows():
 SUBSCRIPTIONS = [{'name': 'Claude Max', 'usd': 200.0}, {'name': 'ChatGPT Pro', 'usd': 200.0}]
 
 
-def page(rows, backlog_text, unsized=(), with_burn=True, plan_windows=False):
+def page(rows, backlog_text, unsized=(), with_burn=True, plan_windows=False, usage=None):
     cal = E.calibrate(rows, NOW, 14)
     backlog = E.parse_backlog(backlog_text) if backlog_text is not None else None
     source = {'label': 'Tiden · Example', 'updated': NOW - timedelta(hours=2)}
     return E.dashboard_html('example/repo', rows, cal, backlog, NOW, source, unsized, burn() if with_burn else None, timezone.utc,
-                            windows() if plan_windows else None, SUBSCRIPTIONS if plan_windows else ())
+                            windows() if plan_windows else None, SUBSCRIPTIONS if plan_windows else (), usage=usage)
 
 
 def worst_backlog(n=200):
@@ -86,7 +111,8 @@ def worst_backlog(n=200):
 def main(out):
     out = Path(out); out.mkdir(parents=True, exist_ok=True); rows = history()
     no_cost = [{**r, 'actual': {**r['actual'], 'usd': None, 'cost_complete': False}} for r in rows]
-    cases = {'dashboard.html': page(rows, BACKLOG, UNSIZED, plan_windows=True),
+    cases = {'dashboard.html': page(rows, BACKLOG, UNSIZED, plan_windows=True, usage=usage()),
+             'usage-no-labels.html': page(rows, None, with_burn=False, usage=usage(labels=False)),
              'no-windows.html': page(rows, BACKLOG, UNSIZED),
              'unsized-only.html': page(rows, None, UNSIZED),
              'no-cost.html': page(no_cost, BACKLOG),

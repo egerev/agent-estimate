@@ -36,6 +36,16 @@ SP with their sample sizes, and days for the whole backlog. The source line name
 `Tiden · Shop · 52 cards · updated 22 Oct 07:29 UTC`. Cards without a size are listed at the end and
 left out of the totals. Details stay in the CLI (`forecast --backlog`, `calibrate`, `backtest`).
 
+The **Usage** section (30 or 90 days, also `estimate usage [--days 7|30|90] [--json]`) reads the same local
+logs for every repo: $ and tokens per repo (each session's folder maps to its git remote, so worktrees pool),
+the top 10 sessions by $ with a short label (the first line of the first prompt, cut to 60 characters;
+`--no-labels` or `"session_labels": false` in `config.json` hides it), cache tiles (processed tokens, cached
+input share, uncached input, output, and what cached reads saved at the input price), daily $ by agent and
+by model, how many sessions you run at once (median and p80 over active 15-minute slots, shown next to the
+planner's agent count as "you usually run ~N"), merged PRs per session, and a model table where a model
+without a price is marked approximate. A folder with no git
+repo is listed as `~/<top folder> (folder)`.
+
 ### Plan windows and subscriptions
 
 The window cards show how much of the Claude 5-hour and weekly windows and the Codex week is used, with
@@ -134,6 +144,26 @@ export ESTIMATE_CLAUDE_PROJECT_DIR=~/.claude/projects/-work-shop   # --claude-pr
 For several projects in one shell, use a function rather than an alias in a string variable:
 `shop() { ESTIMATE_DIR=~/estimates/shop ESTIMATE_REPO=acme/shop estimate "$@"; }`.
 
+### Running from worktrees and many agents
+
+Each worktree is its own checkout, so `<git root>/.estimate` differs per worktree, and an agent started
+in one sees an empty data dir. Link the data dir to the repo once instead:
+
+```sh
+estimate link --dir ~/estimates/shop [--claude-project-dir ~/.claude/projects/-work-shop]
+```
+
+This writes `~/.config/agent-estimate/projects.json` (`$ESTIMATE_REGISTRY`), keyed by the git remote
+(`owner/repo`), so every worktree, branch and agent of the repo resolves the same dir, repo and trusted
+Claude transcript dirs. `estimate setup` writes the same entry. Without `--dir` or `$ESTIMATE_DIR`,
+`estimate` looks for, in order: the nearest `.estimate/` above the current directory that holds a
+ledger, history or config; the registry entry for the git remote; `<git root>/.estimate`.
+
+`estimate doctor` prints what it resolved and from where, the ledger and history counts, calibration n,
+`gh` auth and the status-line hook. On an empty data dir, `forecast` and `dashboard` stop with one
+message naming the dir instead of printing n=0 numbers. Many agents can log estimates at once: the
+ledger is append-only.
+
 ## Use
 
 In a new repo with no history, just start: every `estimate forecast --task ...` is logged and gets
@@ -163,14 +193,24 @@ estimate forecast --sp 3 --task 142 --model claude-opus-5-5   # one line; logs t
 estimate forecast --sp 3 --closest 120 --task my-branch ...   # optional: the closest past PR
 estimate forecast --backlog backlog.md                        # totals + Score order (see Backlog)
 estimate forecast --backlog                                   # the backlog named in .estimate/config.json
+estimate plan [--agents 3] [--top N] [--json]                 # critical-chain plan: dates per agent count (see Plan)
 estimate backlog pull                                         # Tiden source: open cards -> .estimate/backlog.md
 estimate record                                               # settle merged PRs (automatic actuals)
 estimate record --refresh                                     # remeasure tracked PRs after log/price changes
+estimate record --all                                         # every project in ~/.config/agent-estimate/projects.json, one line each
+estimate dashboard --all                                      # the same loop for dashboards
 estimate calibrate                                            # ranges per SP and per estimator
 estimate dashboard                                            # .estimate/dashboard.html
+estimate usage [--days 7|30|90] [--json] [--no-labels]        # spend by repo, cache, trend, parallel sessions, models
 estimate backtest                                             # leave-future-out accuracy
 estimate compare --dir ../app-a/.estimate --dir ../app-b/.estimate   # process traits per project
 ```
+
+`--all` (for a nightly job) prints one line per project (`settled`, `new PRs`, `calibration n`, `pre-work
+n`), goes on after a project fails, and exits non-zero only when every project failed. A branch estimate
+whose branch has no PR (open or merged) after 7 days is marked `no PR` by `record` (`--no-pr-days N`, 0 never):
+it stays in the ledger, leaves the pending list, is listed by `estimate doctor`, and a PR merged later
+still settles it.
 
 A PR body line `SP: 3` is also picked up by `record` (estimator and original sizing time unknown).
 It is timestamped when first observed, never backdated to PR creation. It is excluded as a
@@ -178,7 +218,9 @@ prospective backtest target; it can inform later forecasts once it was actually 
 
 Global flags: `--repo owner/name` (default: the current repo), `--dir` (data directory, default
 `<git root>/.estimate`), `--window 14` (days), `--idle-min 5`, `--claude-dir`, `--codex-dir`,
-`--claude-project-dir PATH` (repeatable, explicitly trusts a transcript directory for this repo).
+`--claude-project-dir PATH` (repeatable, explicitly trusts a transcript directory under `~/.claude/projects` for
+this repo; a checkout path is mapped to its transcript directory there, anything else gets a warning in `link`
+and `doctor`. Usually omit it: matching by repo and branch is the default).
 `--claude-all` remains accepted for compatibility; scanning now checks identity in every directory.
 
 ## Backlog
@@ -205,6 +247,12 @@ rows out of the totals and the order instead and names them in a warning (an ite
 is kept in file order). The old `<SP> <title>` line format still works; those items have no
 Score and come after scored ones. See `examples/backlog.example.md`.
 
+The totals separate work from elapsed time. **Agent active time, summed** is one agent working
+serially, not wall clock. **Wall clock** lines give calendar days for 1, 2, 3 and 5 agents in parallel
+(p20–p80), never shorter than the longest dependency chain; for 2+ agents they assume perfect hand-offs,
+so read them as a lower bound. One `calibration n=…` line counts PRs left out of the sample (outside the
+window, no agent logs, pending estimates); `estimate doctor` and `estimate record` list them.
+
 **Where the backlog lives.** `.estimate/config.json` names the source; `estimate forecast --backlog`
 without FILE uses it:
 
@@ -221,10 +269,38 @@ For Tiden, `estimate backlog pull` runs `tiden spec list --format json --include
 An open card that Tiden links to a pull request or code anchors gets the note `maybe-done` (Tiden statuses lag
 merges): it stays in the totals, and `forecast` and the dashboard name it until it is closed in Tiden. It also reads the product's name (`tiden product list`) for the dashboard. Id is the Tiden id; `key` is a
 human key such as KEY-21 when the card has one. Effort and Value are taken from `Effort: N` / `Value: N` in the card text when on the scale,
-and Depends from Tiden ids of other open cards on a `Depends on` line. Priority is copied as a column
-and never turned into Value. A re-pull keeps effort, value and depends set locally for the same id and drops
-cards no longer open, with a note. Rows you add by hand with your own id (not a Tiden UUID, e.g. `1`) are never
+and Depends from other open cards named on a `Depends on` line (a Tiden id; a key such as KEY-44; or the product
+code with the card's number, e.g. ACME-225, up to the end of that sentence). Priority is copied as a column
+and never turned into Value. A re-pull keeps effort, value and depends set locally for the same id (an empty
+depends cell takes the card's `Depends on` line; write `-` for none), keeps a `lane` column and any sections
+after the table, and drops cards no longer open, with a note. Rows you add by hand with your own id (not a Tiden UUID, e.g. `1`) are never
 dropped: a re-pull keeps them as they are, after the cards. The pull is read-only: nothing is written back to Tiden.
+
+## Plan
+
+`estimate plan` forecasts when the backlog gets done with 1, 2, 3 and 5 agents (and `--agents K`). It runs a
+list scheduler 500 times (seeded): a free agent takes the next card whose dependencies are merged, in Score
+order, except that a card on the critical chain goes first once delaying it would delay the end. Card time is
+SP × a work rate per SP drawn from the window's merged PRs (the two-level bootstrap of `forecast`), scaled to
+this repo's calendar pace (calendar hours per hour with a PR in flight), then that PR's merge wait (last commit
+to merge). The agent moves on during the merge wait; dependent cards wait for the merge.
+
+It prints p50/p80 finish dates per agent count with what one more agent saves, the max useful agent count
+(the next one saves under 5%), the project buffer (p80 − p50 at the end; no padding per card), the critical
+chain (the longest dependency chain at median card times), waves (cards in start order; a new wave starts at a
+card that needs one of the current wave) with p50/p80 dates, and the most waited-on cards. `--json` adds p20,
+p50 and p80 for every card. Unsized cards are skipped with a warning; cards with unknown or unsized
+dependencies, or in a cycle, are excluded and named. With no dependencies at all, it says the order is Score
+only; under 5 measured PRs the dates are marked rough.
+
+**Lanes** limit parallel work on shared files: an optional `lane` column, with caps in a `## Lanes` section
+below the table (`- migration (cap 1): …`, `- bot.py (merging cap 1)`) or in `.estimate/config.json`, which
+wins per lane: `{"lanes": {"bot.py": {"open": 1}, "migration": {"merging": 1}}}`. `open` caps the lane's cards
+started and not merged; `merging` caps those in their merge wait. Cards without a lane run in parallel.
+
+The dashboard's **Ahead** section draws the next 20 cards in agent lanes for the selected agent count: the
+critical chain in the accent colour, cards that wait for another one dimmed, the merge wait hatched, the p50
+marker and the buffer to p80. The lanes show the simulated run that ends nearest the p50.
 
 ## Measurement details
 
@@ -232,7 +308,7 @@ Per merged PR, automatically, never by hand:
 
 | Field | Meaning |
 |---|---|
-| `wall_h` | earliest available logged task estimate, PR creation, commit or attributed agent record → merge; `start_source` identifies the signal |
+| `wall_h` | earliest available logged task estimate, PR creation, commit or attributed agent record → merge; `start_source` identifies the signal. Agent records at most 10 min before the estimate, with no commit or PR before it, are the sizing itself and do not move the start |
 | `active_h` | approximate observed activity: intervals between records at most 5 min apart within each stream; parallel intervals are unioned |
 | `wait_h` | unknown (`null`): log gaps do not establish review, CI or owner waits |
 | `unobserved_h` | `wall_h − active_h`; may include real work without nearby log records |
@@ -246,7 +322,8 @@ Per merged PR, automatically, never by hand:
 A log record belongs to a PR when its git branch is the PR's head branch inside the PR's window,
 or when its Claude Code session links exactly that one PR. Claude sessions require an exact repository
 PR link, a `cwd` whose git remote matches `owner/name`, or an explicitly trusted
-`--claude-project-dir`. A similar directory name is insufficient. Codex sessions require this repo's
+`--claude-project-dir`. A session whose `cwd` no longer exists (a worktree removed after merge) is accepted
+when a session of the same transcript directory in that `cwd` was identified. A similar directory name is insufficient. Codex sessions require this repo's
 git remote. Parent and subagent files keep separate activity streams, even with a shared session ID.
 Repeated Claude usage snapshots use the final response usage; file discovery order does not affect cost.
 Attribution includes observed branch work before the first commit or PR creation, without a seven-day
@@ -257,6 +334,9 @@ Calibration uses a recent window (default 14 days), rebuilt for every forecast u
 window and saved process cutoff. Overall calibration counts each PR once, preferring its earliest
 non-retro estimate; per-estimator views also count each PR once. A Fibonacci bucket with at least 5 settled PRs
 uses its own p20–p80; otherwise the per-SP rate (hours ÷ SP) of the whole window is scaled by SP.
+The interval is then widened, never narrowed, to the p20–p80 of the leave-one-out forecast error in the
+window (each PR against the median rate of the others), because the p20–p80 of a few past rates holds
+fewer than 60% of new tasks; the p50 stays.
 Each metric shows its own eligible PR count, interval kind and confidence.
 Fewer than 5 PRs give a min–max range and low confidence. Overall confidence uses the weakest available
 time/cost metric; a large wall-time sample does not raise confidence in sparse cost data. Confidence
@@ -319,7 +399,10 @@ directory name. `--json` gives the same numbers for scripts.
   requests. Building it needs no network. Its burn rows read the last 7 days of `~/.claude/projects`
   and `~/.codex/sessions` (every repo, `--claude-dir`/`--codex-dir` to change, `--no-burn` to skip);
   only token counts, timestamps and model names are kept, and the page shows counts, $ and model
-  names, never prompts, outputs or file contents.
+  names, never prompts, outputs or file contents. The Usage section and `estimate usage` read 30 or 90
+  days and also keep each session's working directory (to find its repo through `git remote`) and, unless
+  `--no-labels` or `"session_labels": false`, the first line of its first prompt cut to 60 characters with
+  key-like strings masked; nothing more of any prompt is kept or written.
 - `estimate install --statusline` is opt-in and changes one key, `statusLine` in your Claude Code
   `settings.json` (a copy is kept as `settings.json.estimate-backup`). Its snapshots hold window %, reset
   times and an 8-character hash of the account id, never the e-mail, the session or the working
@@ -327,8 +410,8 @@ directory name. `--json` gives the same numbers for scripts.
 - Prices: `DEFAULT_PRICES` uses version-specific standard Claude API rates, checked against
   [Anthropic's pricing documentation](https://platform.claude.com/docs/en/about-claude/pricing)
   on 2026-10-20, including 5-minute/1-hour cache writes and Haiku 5.5's per-request context tier.
-  The Codex models seen in our logs (`gpt-6-astra`, `gpt-6.1-sol`) use OpenAI's standard list prices as of
-  2026-10 ([pricing](https://developers.openai.com/api/docs/pricing)), including the long-context tier
+  The Codex models seen in our logs (`gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`) use OpenAI's standard list prices as of
+  2026-10-26 ([pricing](https://developers.openai.com/api/docs/pricing)), including the long-context tier
   above 272K input tokens and 30-minute/12-hour cache writes (1.25×/2.5× input). A Codex response logged without token usage keeps that PR's $ unknown, and
   the audit line says so.
   API-equivalent cost is not an actual subscription bill. Provider, fast-mode and other billing

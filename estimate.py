@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import heapq
 import html
+import io
 import json
 import math
 import os
@@ -31,12 +32,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 FIB = (1, 2, 3, 5, 8, 13)
 MAX_SP = 8            # a task above this must be split into parts of at most MAX_SP before work
 VALUES = (1, 2, 3, 5, 8)  # backlog item Value scale; Score = Value / Effort
 MIN_INTERVAL_N = 5    # fewer samples: a min-max range and low confidence, never a p20-p80 interval
 ESTIMATOR_MIN_N = 5   # settled pre-work estimates before an estimator's own rates replace the pooled ones
+SIZING_GRACE_MIN = 10  # agent-log activity this soon before the estimate, with no commit or PR yet, is the sizing itself
+NO_PR_DAYS = 7        # a branch estimate with no PR after this many days is marked 'no PR' by `record`
 METRICS = ('active_h', 'wall_h', 'usd', 'review_rounds')
 SCALED = ('active_h', 'wall_h', 'usd')  # scale with SP; review rounds do not
 OPEN_FIELDS = 'number,title,body,createdAt,headRefName,isDraft'
@@ -59,6 +62,8 @@ def _openai_price(input_usd, output_usd, cache_read):
     return {**_price(input_usd, output_usd, cache_read), 'cache_write_1h': input_usd * 2.5}
 
 
+# Codex rows: OpenAI standard tier, $ per 1M tokens, https://developers.openai.com/api/docs/pricing (fetched 2026-10-26);
+# long context above 272K input tokens.
 DEFAULT_PRICES = {
     'claude-opus-5-5': _price(4, 20, .2),
     'claude-sonnet-5-5': _price(2, 10, .1),
@@ -79,6 +84,7 @@ DEFAULT_PRICES = {
     'claude-opus-4-1': _price(15, 75, 1.5),
     'gpt-6-astra': {**_openai_price(10, 50, 1), 'long_context_threshold': 272_000, 'long_context': _openai_price(20, 75, 2)},
     'gpt-6.1-sol': {**_openai_price(2, 10, .1), 'long_context_threshold': 272_000, 'long_context': _openai_price(4, 15, .2)},
+    'gpt-6-sol': {**_openai_price(2, 10, .2), 'long_context_threshold': 272_000, 'long_context': _openai_price(4, 15, .4)},
 }
 SP_LINE = re.compile(r'(?im)^\s*(?:story\s*points?|sp|estimate)\s*[:=]\s*(\d+)\s*(?:sp)?\s*$')
 ALL = 'all estimators'
@@ -277,6 +283,7 @@ def scan_claude_logs(root, repo_name, repo_full, since=None, scan_all=False, pro
 
     for d in sorted(dirs):
         trusted_sessions = set(); project_links = defaultdict(set); per_stream = defaultdict(list)
+        session_cwds = defaultdict(set); foreign_sessions = set()
         for f in sorted(d.rglob('*.jsonl')):
             if not _mtime_ok(f, since): continue
             try: fh = f.open(encoding='utf-8', errors='replace')
@@ -287,6 +294,7 @@ def scan_claude_logs(root, repo_name, repo_full, since=None, scan_all=False, pro
                     except ValueError: continue
                     if not isinstance(o, dict): continue
                     sid = o.get('sessionId') or f'file:{f.relative_to(d)}'
+                    if isinstance(o.get('cwd'), str): session_cwds[sid].add(o['cwd'])
                     if verified_cwd(o.get('cwd')): trusted_sessions.add(sid)
                     if isinstance(o.get('cwd'), str) and o['cwd'] in contradictory_cwds and d not in trusted_dirs:
                         continue  # An explicit conflicting remote cannot inherit another record's identity.
@@ -294,6 +302,7 @@ def scan_claude_logs(root, repo_name, repo_full, since=None, scan_all=False, pro
                         if str(o.get('prRepository', '')).lower() == repo_full.lower():
                             try: project_links[sid].add(int(o['prNumber'])); trusted_sessions.add(sid)
                             except (KeyError, TypeError, ValueError): pass
+                        elif o.get('prRepository'): foreign_sessions.add(sid)
                         continue
                     if o.get('type') not in ('assistant', 'user'): continue
                     ts = opt_utc(o.get('timestamp')); branch = o.get('gitBranch')
@@ -310,6 +319,14 @@ def scan_claude_logs(root, repo_name, repo_full, since=None, scan_all=False, pro
                     rank = (not usage.get('usage_missing'), ts, usage_tokens(usage), json.dumps(usage, sort_keys=True),
                             str(f), line_no) if usage else None
                     per_stream[stream].append((rec, dedup, rank))
+        # A worktree removed after merge can no longer show its remote. A session whose every cwd is gone
+        # inherits identity from a session of the same transcript dir that ran in one of those cwds and
+        # was identified (its remote while the dir existed, or a pr-link of this repo), unless it links another repo.
+        anchors = {c for t in trusted_sessions for c in session_cwds[t]}
+        for sid, cwds in session_cwds.items():
+            if (sid not in trusted_sessions and sid not in foreign_sessions and cwds & anchors
+                    and not any(os.path.isdir(c) for c in cwds)):
+                trusted_sessions.add(sid)
         for stream, entries in sorted(per_stream.items()):
             file_path, sid, main, _ = stream
             if d not in trusted_dirs and sid not in trusted_sessions: continue
@@ -591,6 +608,12 @@ def fetch_prs(repo, state, limit):
     return out
 
 
+def branch_has_pr(repo, branch):
+    """Whether `branch` has an open or merged PR (any age; the fetched history page may not reach it)."""
+    found = run_gh(['pr', 'list', '--repo', repo, '--head', branch, '--state', 'all', '--limit', '20', '--json', 'state'])
+    return any(p.get('state') in ('OPEN', 'MERGED') for p in found or [])
+
+
 def fetch_pr(repo, number):
     """Fetch a tracked PR even when it falls outside the recent history page."""
     fields = 'number,title,body,createdAt,mergedAt,additions,deletions,changedFiles,headRefName,files,reviews,commits'
@@ -612,10 +635,16 @@ def pr_actual(p, agent):
     for c in p.get('commits') or []:
         d = opt_utc(c.get('authoredDate'))
         if d and d <= merged: starts.append((d, 'commit'))
-    if (made := opt_utc(p.get('estimateStartAt'))) and made <= merged:
+    made = opt_utc(p.get('estimateStartAt'))
+    if made and made <= merged:
         starts.append((made, 'estimate'))
     if agent and agent.get('first_ts') and agent['first_ts'] <= merged:
-        starts.append((agent['first_ts'], 'agent-log'))
+        first = agent['first_ts']
+        # The agent that logs the estimate usually reads the task in the same session first: activity a few
+        # minutes before the estimate, with no commit or PR before it, is that sizing, not work.
+        sizing = (made and made <= merged and timedelta(0) < made - first <= timedelta(minutes=SIZING_GRACE_MIN)
+                  and all(ts >= made for ts, _ in starts))
+        if not sizing: starts.append((first, 'agent-log'))
     if bound:
         starts = [(ts, source) for ts, source in starts if ts >= bound]
         if not starts: starts = [(bound, 'previous-merge-bound')]
@@ -671,6 +700,7 @@ class Store:
             elif e['id'] in rows:
                 if e['kind'] == 'actual': rows[e['id']]['actual'] = {k: v for k, v in e.items() if k not in ('kind', 'id')}
                 elif e['kind'] == 'superseded': rows[e['id']]['superseded'] = True
+                elif e['kind'] == 'no-pr': rows[e['id']]['no_pr'] = e.get('at') or True
         return list(rows.values())
 
     def read_json(self, name, default=None):
@@ -704,6 +734,26 @@ def new_estimate(sp, task_ref, source, created_at, agent, model, closest=None, q
 
 def settled(rows):
     return [r for r in rows if r.get('actual') and r.get('sp') and not r.get('superseded')]
+
+
+def unsettled(rows):
+    """Estimates without an actual, including those marked 'no PR' (a late PR still settles them)."""
+    return [r for r in rows if not r.get('actual') and not r.get('superseded')]
+
+
+def pending_rows(rows):
+    """Estimates awaiting settlement: unsettled and not marked 'no PR'."""
+    return [r for r in unsettled(rows) if not r.get('no_pr')]
+
+
+def no_pr_marks(pending, merged, now, days=NO_PR_DAYS):
+    """Candidate 'no-pr' events (with the branch as `ref`) for branch estimates older than `days` that no
+    fetched merged PR settles; `record` drops those whose branch has an open or merged PR before writing."""
+    if days <= 0: return []
+    old = now - timedelta(days=days)
+    return [{'kind': 'no-pr', 'id': r['id'], 'at': iso(now), 'after_days': days, 'ref': r['task_ref']} for r in pending
+            if task_pr(r['task_ref']) is None and utc(r['created_at']) <= old
+            and not match_pr(r, merged)]
 
 
 def one_per_pr(rows):
@@ -777,6 +827,24 @@ def _rates(rs, m):
             if (value := metric_value(r['actual'], m)) is not None]
 
 
+def loo_resid(rows, m):
+    """p20 and p80 of log(actual / leave-one-out forecast) over `rows`, or None below MIN_INTERVAL_N.
+
+    Each row is forecast from the other rows the way `quote` would: its SP bucket's median when that has
+    MIN_INTERVAL_N rows, else the median per-SP rate times its SP. That is the error a new task meets, which
+    the in-sample p20-p80 of a few values understates (the median itself is uncertain).
+    """
+    pts = [(r['sp'], v) for r in rows if (v := metric_value(r['actual'], m)) and v > 0]
+    if len(pts) < MIN_INTERVAL_N: return None
+    res = []
+    for i, (sp, v) in enumerate(pts):
+        others = [p for j, p in enumerate(pts) if j != i]
+        same = [w for s, w in others if s == sp]
+        mid = statistics.median(same) if len(same) >= MIN_INTERVAL_N else statistics.median(w / s for s, w in others) * sp
+        res.append(math.log(v / mid))
+    return [round(percentile(res, .2), 4), round(percentile(res, .8), 4)]
+
+
 def _stats(cur, prev):
     """Per-SP rates, Fibonacci buckets, drift against the previous window, and consistency."""
     s = {'n': len(cur), 'prework': sum(map(_prospective_estimate, cur)),
@@ -792,6 +860,7 @@ def _stats(cur, prev):
             ratio = statistics.median(a) / statistics.median(b)
             s['drift'][m] = {'ratio': round(ratio, 2), 'flag': ratio > 2 or ratio < .5}
     anch = [r for r in cur if r.get('closest_pr')]; free = [r for r in cur if not r.get('closest_pr')]
+    s['loo_resid'] = {m: loo_resid(cur, m) for m in SCALED}
     s['consistency'] = {m: ratio_p80_p20(_rates(cur, m)) for m in SCALED}
     s['anchored'] = {'n': len(anch), 'wall_h': ratio_p80_p20(_rates(anch, 'wall_h')), 'active_h': ratio_p80_p20(_rates(anch, 'active_h'))}
     s['unanchored'] = {'n': len(free), 'wall_h': ratio_p80_p20(_rates(free, 'wall_h')), 'active_h': ratio_p80_p20(_rates(free, 'active_h'))}
@@ -842,7 +911,7 @@ def sample_audit(rows, used, start, end, since=None):
 
     Calibration reasons are exclusive; dollar reasons are not (one PR can lack a price and usage).
     """
-    pending = [r for r in rows if not r.get('actual') and not r.get('superseded')]
+    pending = pending_rows(rows)
     done_keys = {(estimator_key(r), k) for r in settled(rows) for k in (str(r.get('task_ref')), f"#{r['actual']['pr']}")}
     duplicate = lambda r: (estimator_key(r), str(r.get('task_ref'))) in done_keys or (
         (n := task_pr(r.get('task_ref'))) is not None and (estimator_key(r), f'#{n}') in done_keys)
@@ -871,7 +940,8 @@ def sample_audit(rows, used, start, end, since=None):
     return {'sized_prs': len(by_pr), 'used': len(used), 'dropped': dict(dropped),
             'extra_estimates': sum(1 for r in settled(rows) if start <= utc(r['actual']['merged_at']) <= end) - len(used),
             'pending': [str(r.get('task_ref')) for r in pending if not duplicate(r)],
-            'duplicates': [str(r.get('task_ref')) for r in pending if duplicate(r)], 'metrics': metrics}
+            'duplicates': [str(r.get('task_ref')) for r in pending if duplicate(r)],
+            'no_pr': [str(r.get('task_ref')) for r in unsettled(rows) if r.get('no_pr')], 'metrics': metrics}
 
 
 def _pr_list(prs, limit=8):
@@ -905,6 +975,23 @@ def audit_lines(audit, prices=None):
     return out
 
 
+def audit_summary(audit):
+    """One line for forecasts: calibration n and how many PRs or estimates the full audit lists, or None
+    when nothing is missing. The full list is in `estimate doctor` and `estimate record`."""
+    if not audit: return None
+    parts = []
+    if out := sum(len(v) for v in audit['dropped'].values()): parts.append(f'{out} outside the window')
+    no_logs = {n for m in audit['metrics'].values() for why, prs in m['missing'].items() if why.startswith('no agent logs') for n in prs}
+    if no_logs: parts.append(f"{len(no_logs)} PR{'s' if len(no_logs) != 1 else ''} without agent logs")
+    other = {n for m in audit['metrics'].values() for why, prs in m['missing'].items() if not why.startswith('no agent logs') for n in prs} - no_logs
+    if other: parts.append(f"{len(other)} PR{'s' if len(other) != 1 else ''} without a full $ or active-time measure")
+    if audit.get('pending'): parts.append(f"{len(audit['pending'])} estimate{'s' if len(audit['pending']) != 1 else ''} awaiting `estimate record`")
+    repeats = len(audit.get('duplicates') or []) + (audit.get('extra_estimates') or 0)
+    if repeats: parts.append(f"{repeats} repeated estimate{'s' if repeats != 1 else ''} of the same PRs count once")
+    if not parts: return None
+    return f"calibration n={audit['used']} of {audit['sized_prs']} sized PRs; " + ', '.join(parts) + ': see `estimate doctor`'
+
+
 def quote(cal, sp, now=None, estimator=None):
     """SP -> per-metric ranges and confidence from independent PR outcomes.
 
@@ -930,6 +1017,10 @@ def quote(cal, sp, now=None, estimator=None):
             s = spread([x * sp for x in rs] if m in SCALED else rs)
             if not s: continue
             qm = {**s, 'basis': 'per-SP rate × SP' if m in SCALED else 'all sizes'}
+        res = (src.get('loo_resid') or {}).get(m)
+        if res and qm['kind'] == 'p20-p80':
+            # Widen to the leave-one-out forecast error, so p20-p80 holds about 60% of new tasks, not of past ones.
+            qm.update(lo=min(qm['lo'], qm['mid'] * math.exp(res[0])), hi=max(qm['hi'], qm['mid'] * math.exp(res[1])))
         ratio = qm['hi'] / qm['lo'] if qm['lo'] > 0 else None
         drifted = (src.get('drift', {}).get(m) or {}).get('flag', False)
         qm['confidence'] = confidence(qm['n'], ratio, age, drifted)
@@ -983,7 +1074,8 @@ def scope_note(q):
 # ---------- forecasts ----------
 
 _COLUMNS = {'id': ('id', '#'), 'title': ('title', 'item', 'task'), 'sp': ('effort', 'sp', 'e'),
-            'value': ('value', 'v'), 'depends': ('depends', 'depends on', 'deps'), 'key': ('key',), 'note': ('note', 'notes')}
+            'value': ('value', 'v'), 'depends': ('depends', 'depends on', 'deps'), 'key': ('key',), 'note': ('note', 'notes'),
+            'lane': ('lane',)}
 SHORT_ID = 8                                   # a UUID id is shown, and may be referenced, by this many leading chars
 _UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
@@ -1030,7 +1122,7 @@ def _parse_table(cols, lines, unsized=None):
         if value and not re.fullmatch(r'\d+', value): raise ValueError(f'backlog value must be one of {VALUES}: {line.strip()!r}')
         items.append({'id': get('id').lstrip('#') or str(row), 'title': get('title') or f'item {row}',
                       'sp': int(effort), 'value': int(value) if value else None, 'depends': _depends(get('depends')),
-                      'key': get('key'), 'note': get('note'), 'line': line.strip(), 'implicit': not get('id').lstrip('#')})
+                      'key': get('key'), 'note': get('note'), 'lane': get('lane'), 'line': line.strip(), 'implicit': not get('id').lstrip('#')})
     return items
 
 
@@ -1047,7 +1139,7 @@ def _parse_lines(lines):
                 if not m: raise ValueError(f'backlog line has no story points: {line!r}')
                 title, sp = m.group(1), int(m.group(2))
         items.append({'id': str(len(items) + 1), 'sp': sp, 'title': title.strip(' \t-:|,;') or f'item {len(items) + 1}',
-                      'value': None, 'depends': [], 'key': '', 'note': '', 'line': line})
+                      'value': None, 'depends': [], 'key': '', 'note': '', 'lane': '', 'line': line})
     return items
 
 
@@ -1491,14 +1583,26 @@ def maybe_done(item):
     return (item.get('note') or '').lower().startswith('maybe-done')
 
 
-def tiden_cards(specs, statuses=TIDEN_OPEN):
+def depends_refs(text, code=None):
+    """Card refs on a card body's `Depends on` lines: Tiden UUIDs anywhere on the line, and keys such as
+    KEY-44 or product sequence refs such as ACME-225 (product code, dash, seqNum) up to the end of the
+    first sentence, so `Depends on: none for code. Live evidence needs ACME-237.` names nothing."""
+    out = []
+    for line in re.findall(r'(?im)^.*\bdepends on\b.*$', text or ''):
+        out += re.findall(_UUID, line.lower())
+        clause = re.split(r'(?i)\bdepends on\b', line, maxsplit=1)[1]
+        out += re.findall(r'\b[A-Z][A-Z0-9]*-\d+\b', re.split(r'\.(?:\s|$)', clause, maxsplit=1)[0])
+    return list(dict.fromkeys(out))
+
+
+def tiden_cards(specs, statuses=TIDEN_OPEN, code=None):
     """Open work cards from `tiden spec list --format json` (the `requirements` list).
 
     Open: status in `statuses` (default Backlog), and not a container (a card with child cards: its
     children are the work, so its size would be counted twice). Effort and Value come from the first
     `Effort: N` / `Value: N` in the content when N is on the scale (`Value: 5. Effort: 3. Score: 1.67.`);
-    Depends only from Tiden ids of other open cards on a `Depends on` line, written as their label (key
-    or 8-char id prefix). Priority is shown, never turned into Value. `note` flags a card Tiden links to
+    Depends from `Depends on` lines naming other open cards (`depends_refs`: a Tiden id, a key, or the
+    product `code` with a seqNum), written as their label (key or 8-char id prefix). Priority is shown, never turned into Value. `note` flags a card Tiden links to
     merged code while its status is still open (`delivery_note`).
     """
     opened = [s for s in specs if isinstance(s, dict) and s.get('status') in statuses and s.get('id')]
@@ -1506,6 +1610,8 @@ def tiden_cards(specs, statuses=TIDEN_OPEN):
     cards = [s for s in opened if not is_container(s, parents)]
     ids = {s['id'] for s in cards}
     labels, _ = id_aliases([(s['id'], tiden_key(s)) for s in cards])
+    named = {tiden_key(s): s['id'] for s in cards if tiden_key(s)}
+    if code: named.update({f"{code}-{s['seqNum']}": s['id'] for s in cards if isinstance(s.get('seqNum'), int)})
 
     def number(text, label, scale):
         m = re.search(rf'(?i)\b{label}\s*:\s*(\d+)\b', text)
@@ -1513,10 +1619,11 @@ def tiden_cards(specs, statuses=TIDEN_OPEN):
     out = []
     for s in cards:
         text = s.get('content') or ''
-        refs = re.findall(_UUID, ' '.join(re.findall(r'(?im)^.*\bdepends on\b.*$', text)).lower())
+        refs = [named.get(r, r) for r in depends_refs(text, code)]
         out.append({'id': s['id'], 'key': tiden_key(s), 'title': s.get('title') or '', 'effort': number(text, 'effort', FIB),
                     'value': number(text, 'value', VALUES),
                     'depends': ', '.join(labels[r] for r in dict.fromkeys(refs) if r in ids and r != s['id']),
+                    'depends_ids': [r for r in dict.fromkeys(refs) if r in ids and r != s['id']],
                     'status': s['status'], 'priority': s.get('priority') or '', 'type': s.get('type') or '',
                     'note': delivery_note(s)})
     return out
@@ -1562,15 +1669,24 @@ def run_tiden(product_id=None, cwd=None, page_size=TIDEN_PAGE):
 
 def tiden_product_name(product_id, specs, cwd=None):
     """The product's name from read-only `tiden product list`, for the dashboard's source line; None on any failure."""
+    return tiden_product(product_id, specs, cwd)['name']
+
+
+def tiden_product(product_id, specs, cwd=None):
+    """{'name', 'code'} of the product from read-only `tiden product list`; each None on any failure. The code
+    (e.g. ACME) prefixes the product's sequence refs in card text, such as ACME-225."""
+    none = {'name': None, 'code': None}
     pid = product_id or next((s.get('productId') for s in specs if isinstance(s, dict) and s.get('productId')), None)
-    if not pid: return None
+    if not pid: return none
     try:
         r = subprocess.run(['tiden', 'product', 'list', '--format', 'json'], capture_output=True, text=True, check=True, cwd=cwd, timeout=60)
         data = json.loads(r.stdout)
-    except (OSError, subprocess.SubprocessError, ValueError): return None
+    except (OSError, subprocess.SubprocessError, ValueError): return none
     products = data.get('products') if isinstance(data, dict) else data
-    name = next((p.get('name') for p in products if isinstance(p, dict) and p.get('id') == pid), None) if isinstance(products, list) else None
-    return ' '.join(name.split()) if isinstance(name, str) and name.strip() else None
+    p = next((p for p in products if isinstance(p, dict) and p.get('id') == pid), {}) if isinstance(products, list) else {}
+    name, code = p.get('name'), p.get('code')
+    return {'name': ' '.join(name.split()) if isinstance(name, str) and name.strip() else None,
+            'code': code.strip() if isinstance(code, str) and re.fullmatch(r'[A-Z][A-Z0-9]*', code.strip()) else None}
 
 
 def _short_list(names, limit=8):
@@ -1584,7 +1700,7 @@ def pulled_source(text):
     return (name.group(1).strip() if name else None), (opt_utc(when.group(1)) if when else None)
 
 
-def pull_tiden(specs, existing, product_id, now, statuses=TIDEN_OPEN, product_name=None):
+def pull_tiden(specs, existing, product_id, now, statuses=TIDEN_OPEN, product_name=None, code=None):
     """(Markdown backlog text, notes). A row already in the local table keeps its effort/value/depends
     cells as they are, empty ones included; card values fill only new rows. Cards no longer open (status
     not in `statuses`) are dropped; refs (id, key or 8-char prefix) to delivered (Active/Done) specs leave
@@ -1597,7 +1713,7 @@ def pull_tiden(specs, existing, product_id, now, statuses=TIDEN_OPEN, product_na
     for i, fields in table: local.setdefault(i, fields)
     rows = {i: f['row'] for i, f in local.items()}
     _, old_resolve = id_aliases([(i, f['key']) for i, f in local.items()])
-    cards = tiden_cards(specs, statuses)
+    cards = tiden_cards(specs, statuses, code)
     every = [s for s in specs if isinstance(s, dict) and s.get('id')]
     names, resolve = id_aliases([(s['id'], tiden_key(s)) for s in every])
     labels, _ = id_aliases([(c['id'], c['key']) for c in cards])
@@ -1610,15 +1726,20 @@ def pull_tiden(specs, existing, product_id, now, statuses=TIDEN_OPEN, product_na
     own = {m['id'] for m in manual}
     for c in cards + manual:
         mine = c['id'] in local
-        if mine and c['id'] in taken: c.update({k: v for k, v in local[c['id']].items() if k not in ('row', 'key')})
+        if mine and c['id'] in taken:
+            # An empty depends cell takes the card's `Depends on` line; a hand-filled one (`-` for none) stays.
+            c.update({k: v for k, v in local[c['id']].items() if k not in ('row', 'key') and (k != 'depends' or v.strip())})
+        # Refs from the card's text are current Tiden ids; only refs kept from the old table resolve against its aliases.
+        fresh = c.pop('depends_ids', None) if c['id'] in taken and not (mine and local[c['id']]['depends'].strip()) else None
+        c.pop('depends_ids', None)
         out = []
-        for d in _depends(c['depends']):
-            full = old_resolve(d) if mine and old_resolve(d) in local else resolve(d)
+        for d in fresh if fresh is not None else _depends(c['depends']):
+            full = d if fresh is not None else old_resolve(d) if mine and old_resolve(d) in local else resolve(d)
             if full in delivered: continue
             label = labels.get(full, full if full in status else d)
             # A label that is also a hand-written row's id would point at that row: write the full id instead.
             out.append(full if label in own and label != full and full in status else label)
-        c['depends'] = ', '.join(out)
+        c['depends'] = ', '.join(out) or ('-' if c['depends'].strip() in ('-', '–', '—') else '')  # `-`: none, by hand
     ids, notes = {c['id'] for c in cards}, []
     opened = {s['id'] for s in every if s.get('status') in statuses}
     parents = {s.get('parentId') for s in every if s['id'] in opened}
@@ -1640,7 +1761,8 @@ def pull_tiden(specs, existing, product_id, now, statuses=TIDEN_OPEN, product_na
     if kept: notes.append(f"kept {len(kept)} hand-written row(s) without a Tiden id: {_short_list(kept)}")
     added = sum(c['id'] not in local for c in cards)
     if local and added: notes.append(f'added {added} new card(s)')
-    cols = ('id', 'key', 'title', 'effort', 'value', 'depends', 'status', 'priority', 'type', 'note')
+    cols = ('id', 'key', 'title', 'effort', 'value', 'depends') + (('lane',) if 'lane' in names_old else ()) + \
+        ('status', 'priority', 'type', 'note')
     known = set(cols) | {a for aliases in _COLUMNS.values() for a in aliases}
     cols += tuple(n for n in dict.fromkeys(names_old) if n and n not in known)  # columns added by hand keep their cells
     for c in cards: c.update({k: rows.get(c['id'], {}).get(k, '') for k in cols if k not in c})
@@ -1655,8 +1777,18 @@ def pull_tiden(specs, existing, product_id, now, statuses=TIDEN_OPEN, product_na
             'code to the card while its status is still open; it is counted until it is closed in Tiden.\n'
             + (f'Left out {len(containers)} container card(s) (their child cards are the work).\n' if containers else '') + '\n'
             f"| {' | '.join(cols)} |\n|{'|'.join('-' * (len(k) + 2) for k in cols)}|\n"
-            + ''.join(f"| {' | '.join(cell(c.get(k, '')) for k in cols)} |\n" for c in cards + manual))
+            + ''.join(f"| {' | '.join(cell(c.get(k, '')) for k in cols)} |\n" for c in cards + manual)
+            + (f'\n{after}' if (after := after_table(existing)) else ''))
     return text, notes
+
+
+def after_table(text):
+    """Everything after the backlog table (`## Lanes`, notes), kept by a re-pull; '' when there is none."""
+    lines = (text or '').splitlines(keepends=True)
+    start = next((n for n, line in enumerate(lines) if _header(line.strip())), None)
+    if start is None: return ''
+    end = next((n for n in range(start + 1, len(lines)) if not lines[n].strip().startswith('|')), len(lines))
+    return ''.join(lines[end:]).lstrip('\n')
 
 
 # ---------- dashboard ----------
@@ -1709,6 +1841,17 @@ def critical_path(items):
     return {'sp': sp, 'chain': chain, 'cycle': cycle, 'unknown': unknown}
 
 
+def union_hours(spans):
+    """Hours covered by at least one of the sorted (start, end) spans."""
+    union = 0.0; cur = None
+    for s, e in spans:
+        if cur and s <= cur[1]: cur = (cur[0], max(cur[1], e))
+        else:
+            if cur: union += hours(*cur)
+            cur = (s, e)
+    return union + (hours(*cur) if cur else 0.0)
+
+
 def observed_concurrency(rows, cal):
     """Average PRs in flight in the window: summed PR wall time / union of the PRs' start→merge spans.
 
@@ -1719,13 +1862,7 @@ def observed_concurrency(rows, cal):
     a, b = utc(cal['window']['start']), utc(cal['window']['end'])
     spans = sorted((utc(r['actual']['start_at']), utc(r['actual']['merged_at'])) for r in one_per_pr(settled(rows))
                    if r['actual'].get('start_at') and a <= utc(r['actual']['merged_at']) <= b)
-    total = sum(hours(s, e) for s, e in spans); union = 0.0; cur = None
-    for s, e in spans:
-        if cur and s <= cur[1]: cur = (cur[0], max(cur[1], e))
-        else:
-            if cur: union += hours(*cur)
-            cur = (s, e)
-    if cur: union += hours(*cur)
+    total = sum(hours(s, e) for s, e in spans); union = union_hours(spans)
     return {'value': max(total / union, 1.0), 'prs': len(spans)} if union > 0 else None
 
 
@@ -1741,6 +1878,22 @@ def parallel_days(days, agents, total_sp, path_sp, concurrency=1.0):
     out = {k: max(one[k] / agents, one[k] * share) for k in one}
     out['limited'] = agents > 1 and one['mid'] / agents < one['mid'] * share
     return out
+
+
+ACTIVE_LABEL = 'agent active time, summed (one agent working serially; not wall clock)'
+
+
+def wall_clock_lines(items, days, concurrency=None):
+    """Calendar days with 1, 2, 3 and 5 agents in parallel (`parallel_days`): never below the critical path."""
+    cp = critical_path(items); total = sum(i['sp'] for i in items)
+    if not days or total <= 0: return []
+    if cp['cycle']: return ['wall clock: dependencies form a loop (' + ' → '.join('#' + x for x in cp['cycle']) + '); remove one link to plan']
+    c = (concurrency or {}).get('value') or 1.0; out = []
+    for a in PARALLEL:
+        pd = parallel_days(days, a, total, cp['sp'], c)
+        out.append(f"wall clock, {_agents(a) + ':':<10}{_num(pd['lo'])}–{_num(pd['hi'])} d (median {_num(pd['mid'])} d; {days['kind']}"
+                   + (f"; the {cp['sp']} SP dependency chain sets the floor" if pd['limited'] else '') + ')')
+    return out + ['  2+ agents assume perfect hand-offs and no extra waits: a lower bound, not a promise']
 
 
 def _when(d):
@@ -1763,7 +1916,10 @@ def _hrs(h):
 
 # ---------- burn: every local agent response, any repo ----------
 
-def scan_burn(claude_root, codex_root, since, prices, limits=None):
+_SCAN_CACHE = None   # a dict while `run_all` runs: one log scan feeds every project
+
+
+def scan_burn(claude_root, codex_root, since, prices, limits=None, meta=None, labels=True):
     """API-equivalent burn since `since` from local Claude Code transcripts and Codex sessions, every repo.
 
     One record per response: (ts, agent, model, tokens, usd or None when the model has no price, streams, key).
@@ -1777,12 +1933,35 @@ def scan_burn(claude_root, codex_root, since, prices, limits=None):
     forked session copies history) and `key` identifies the response, so agent hours count a copied stretch
     once. Lines are filtered by a byte search before parsing; only timestamps, model names and token counts are
     kept, never message text. With a `limits` list, the newest Codex `rate_limits` numbers (`codex_limits`)
-    replace its contents.
+    replace its contents. With a `meta` dict, each session (`session_key` of a stream) gets its cwd, Codex git
+    remote (owner/name), pr-link repos and, with `labels`, a short first-line label (`prompt_label`) and nothing
+    more of it; without `labels` no user line is decoded. A record also carries its normalized usage and its home
+    stream: of the sessions it appears in (a fork or resume copies history), the one that began first. Inside
+    `run_all` the scan is shared between projects (same logs, `since`, `labels`); only the prices are applied again.
     """
+    # One decision per run: labels are read when any project shows them and stay in memory; a project that hides
+    # labels still hides them in its report (`usage_report(labels=False)`), so mixed settings do not cost a second scan.
+    if _SCAN_CACHE is not None: labels = _SCAN_CACHE.get('labels', labels)
+    key = (str(Path(claude_root).expanduser()), str(Path(codex_root).expanduser()), since, labels, meta is not None, limits is not None)
+    if _SCAN_CACHE is not None and key in _SCAN_CACHE:
+        cands, seen, opened, cached_meta, cached_limits = _SCAN_CACHE[key]
+        if meta is not None: meta.update(cached_meta)
+        if limits is not None: limits[:] = cached_limits
+    else:
+        cands, seen, opened = _scan_burn_logs(claude_root, codex_root, since, limits, meta, labels)
+        if _SCAN_CACHE is not None: _SCAN_CACHE[key] = (cands, seen, opened, dict(meta or {}), list(limits or []))
+    return _price_burn(cands, seen, opened, prices)
+
+
+def _scan_burn_logs(claude_root, codex_root, since, limits, meta, labels):
+    """The price-free part of `scan_burn`: (cands, seen, opened) from the logs."""
     cands = {}; seen = defaultdict(set); echoes = {}   # echoes: report key -> the record key it repeats
+
+    opened = {}   # stream -> when its session began: a copied response belongs to the session that began first
 
     def add(key, rec):
         seen[key].add(rec[5])
+        if rec[5] not in opened or rec[0] < opened[rec[5]]: opened[rec[5]] = rec[0]
         if key not in cands or rec[3] > cands[key][3]: cands[key] = rec
     root = Path(claude_root).expanduser()
     for f in sorted(root.rglob('*.jsonl')) if root.is_dir() else ():
@@ -1790,10 +1969,23 @@ def scan_burn(claude_root, codex_root, since, prices, limits=None):
         try: fh = f.open('rb')
         except OSError: continue
         with fh:
+            # A subagent's prompt is not its session's label; user lines are parsed only until their session has one.
+            need_label = meta is not None and labels and 'subagents' not in f.relative_to(root).parts
             for n, line in enumerate(fh):
-                if b'"usage"' not in line: continue
+                # A user line (a prompt or a tool result) is decoded only to label its session, never otherwise.
+                if (b'"type":"user"' in line or b'"type": "user"' in line) and b'"type":"assistant"' not in line \
+                        and b'"type": "assistant"' not in line:
+                    if not need_label or _labelled(meta, line, f): continue
+                elif b'"usage"' not in line and not (meta is not None and b'"pr-link"' in line): continue
                 try: o = json.loads(line)
                 except ValueError: continue
+                if meta is not None and isinstance(o, dict):
+                    s = _session_meta(meta, f"claude:{o.get('sessionId') or f}", 'claude-code')
+                    if not s['cwd'] and isinstance(o.get('cwd'), str): s['cwd'] = o['cwd']
+                    s['dir'] = s['dir'] or str(root / f.relative_to(root).parts[0])
+                    if o.get('type') == 'pr-link' and o.get('prRepository'): s['repos'].add(str(o['prRepository']))
+                    if need_label and o.get('type') == 'user' and not s['label'] and not o.get('isMeta') and not o.get('isSidechain'):
+                        s['label'] = claude_label(o.get('message'))
                 if not isinstance(o, dict) or o.get('type') != 'assistant' or not isinstance(o.get('message'), dict): continue
                 msg = o['message']; u = msg.get('usage'); model = msg.get('model')
                 if not isinstance(u, dict) or not u or model == '<synthetic>': continue
@@ -1809,11 +2001,24 @@ def scan_burn(claude_root, codex_root, since, prices, limits=None):
         except OSError: continue
         with fh:
             model = last = record = report = None; stream = f'codex:{f}'
+            s = _session_meta(meta, stream, 'codex') if meta is not None else None; need_label = s is not None and labels
             for line in fh:
-                if not any(k in line for k in (b'"turn_context"', b'"token_usage_record"', b'"token_count"')): continue
+                if not any(k in line for k in (b'"turn_context"', b'"token_usage_record"', b'"token_count"', b'"session_meta"')) and not (
+                        need_label and (b'"user"' in line or b'"user_message"' in line)):
+                    continue
                 try: o = json.loads(line)
                 except ValueError: continue
-                pl = o.get('payload') if isinstance(o, dict) and isinstance(o.get('payload'), dict) else {}
+                if not isinstance(o, dict): continue
+                pl = o.get('payload') if isinstance(o.get('payload'), dict) else {}
+                if o.get('type') == 'session_meta':
+                    if (began := opt_utc(pl.get('timestamp') or o.get('timestamp'))) and stream not in opened: opened[stream] = began
+                    if s is not None:
+                        if isinstance(pl.get('cwd'), str): s['cwd'] = s['cwd'] or pl['cwd']
+                        git = pl.get('git') if isinstance(pl.get('git'), dict) else {}
+                        s['remote'] = s['remote'] or github_repo(git.get('repository_url'))   # owner/name only, never userinfo
+                    continue
+                if need_label and (label := codex_label(o.get('type'), pl)):
+                    s['label'] = label; need_label = False; continue
                 if o.get('type') == 'turn_context': model = pl.get('model') or model; continue
                 ts = opt_utc(o.get('timestamp')); fresh = bool(ts and ts >= since)
                 if o.get('type') == 'token_usage_record' and isinstance(pl.get('usage'), dict):
@@ -1840,10 +2045,18 @@ def scan_burn(claude_root, codex_root, since, prices, limits=None):
                 if fresh: add(key, (ts, 'codex', model, usage_tokens(u), u, stream))
     for key, target in echoes.items():               # an echo, here or in a copied file, belongs to its record
         if key in cands and key != target: seen[target] |= seen.pop(key); del cands[key]
+    return cands, seen, opened
+
+
+def _price_burn(cands, seen, opened, prices):
     recs = []
+    fams = {}
+    last = datetime.max.replace(tzinfo=timezone.utc)
     for key, (ts, agent, model, tokens, u, _) in cands.items():
-        fam = model_family(model, prices)
-        recs.append((ts, agent, model, tokens, message_cost(u, prices[fam]) if fam else None, tuple(sorted(seen[key])), key))
+        fam = fams[model] if model in fams else fams.setdefault(model, model_family(model, prices))
+        home = min(seen[key], key=lambda st: (opened.get(st, last), st))
+        recs.append((ts, agent, model, tokens, message_cost(u, prices[fam]) if fam else None, tuple(sorted(seen[key])), key,
+                     normalize_usage(u), home))
     return sorted(recs, key=lambda r: r[0])
 
 
@@ -1875,6 +2088,345 @@ def burn_report(recs, now, tz=None, idle_min=5.0):
         p['agent_h'] = sum(gaps.values())
         out[name] = p
     return out
+
+
+# ---------- usage: spend by repo, cache, trend, parallelism, models (every local log) ----------
+
+USAGE_DAYS = (7, 30, 90)     # `estimate usage --days`; the dashboard offers the last two
+LABEL_CHARS = 60             # a session label: the first line of its first prompt, cut to this many characters
+SLOT_MIN = 15                # parallelism counts sessions active in slots this long
+TOP_SESSIONS = 10
+TOP_REPOS = 10               # repos shown by name; the rest are summed as "other"
+GIT_TIMEOUT_S = 5            # a git remote lookup for a session folder gives up after this long
+_KEY_WORD = re.compile(r'(?i)^(?:sk|pk|rk)[-_]|^gh[pousr]_|^github_pat[_]|^xox[abprs]-|^(?:AKIA|ASIA)[0-9A-Z]{12}|^eyJ[\w-]{8,}\.|^glpat-|^AIza')
+_KEY_NAME = re.compile(r'(?i)(?:key|token|secret|passw|pwd|auth|bearer|credential|cookie|session)')
+
+
+def _session_meta(meta, session, agent):
+    return meta.setdefault(session, {'agent': agent, 'cwd': None, 'dir': None, 'remote': None, 'label': None, 'repos': set()})
+
+
+def _labelled(meta, line, f):
+    """Whether the Claude session of a raw transcript line already has a label (read without parsing the line)."""
+    m = re.search(rb'"sessionId":\s*"([^"\\]+)"', line)
+    s = meta.get(f"claude:{m.group(1).decode('utf-8', 'replace') if m else f}")
+    return bool(s and s['label'])
+
+
+def session_key(stream):
+    """The session a burn stream belongs to: a Claude subagent stream (`claude:<session>:<agent id>`) pools into its session."""
+    return stream.rsplit(':', 1)[0] if stream.startswith('claude:') else stream
+
+
+def _secretish(word, after_key):
+    """Whether one word of a prompt looks like a credential: a known key prefix, the word after `Bearer` or
+    `token:`, or a long run that is mostly letters and digits with both. Linear in the word."""
+    core = word.strip('\'"`()[]{}<>,;')
+    if not core: return False
+    if after_key or _KEY_WORD.search(core): return True
+    letters = sum(c.isalpha() for c in core); digits = sum(c.isdigit() for c in core)
+    return len(core) >= 20 and letters > 0 and digits > 0 and letters + digits >= len(core) * .7
+
+
+def prompt_label(text):
+    """A session label: the first non-empty line, whitespace collapsed, URL userinfo dropped, credential-like words
+    and `name=value` secrets masked, at most LABEL_CHARS. Linear: the line is cut long before masking."""
+    line = next((x for x in str(text).splitlines() if x.strip()), '')[:LABEL_CHARS * 8]
+    words = []; after = False
+    for w in line.split():
+        w = re.sub(r'(?<=://)[^/@\s]*@', '', w)                         # https://user:pass@host -> https://host
+        if after and w.lower() in ('bearer', 'basic'): words.append(w); continue   # `Authorization: Bearer <token>`
+        name, sep, value = w.partition('=') if '=' in w else w.partition(':') if re.match(r'[\w-]+:\S', w) else (w, '', '')
+        if sep and value and _KEY_NAME.search(name) and '//' not in value: w = f'{name}{sep}…'
+        elif _secretish(w, after): w = '…'
+        after = w.lower() in ('bearer', 'basic') or (w.endswith((':', '=')) and bool(_KEY_NAME.search(w)))
+        words.append(w)
+    line = ' '.join(words)
+    return (line if len(line) <= LABEL_CHARS else line[:LABEL_CHARS - 1].rstrip() + '…') or None
+
+
+def claude_label(msg):
+    """Label of a Claude user message: a slash command's name, or the first line of its text; None for a tool
+    result or harness text (`<...>`), so the first real prompt labels the session."""
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        if any(isinstance(c, dict) and c.get('type') == 'tool_result' for c in content): return None
+        content = next((c.get('text') for c in content if isinstance(c, dict) and c.get('type') == 'text' and isinstance(c.get('text'), str)), None)
+    if not isinstance(content, str) or not content.strip(): return None
+    text = content.lstrip()
+    if m := re.search(r'<command-name>\s*(/?[\w:.-]+)\s*</command-name>', text): return prompt_label(m.group(1))
+    return None if text.startswith('<') else prompt_label(text)
+
+
+def codex_label(kind, pl):
+    """Label of a Codex user turn (`event_msg/user_message`, or a user `response_item` message); None for the
+    injected AGENTS.md and `<environment_context>` items."""
+    if kind == 'event_msg' and pl.get('type') == 'user_message' and isinstance(pl.get('message'), str): texts = [pl['message']]
+    elif kind == 'response_item' and pl.get('type') == 'message' and pl.get('role') == 'user' and isinstance(pl.get('content'), list):
+        texts = [c.get('text') for c in pl['content'] if isinstance(c, dict) and isinstance(c.get('text'), str)]
+    else: return None
+    for t in texts:
+        t = (t or '').lstrip()
+        if t and not t.startswith('<') and not t.startswith('# AGENTS.md'): return prompt_label(t)
+    return None
+
+
+def github_repo(url):
+    """owner/name of a GitHub remote URL (https, ssh or scp-like), else None."""
+    m = re.fullmatch(r'(?:(?:https?|ssh|git)://(?:[^@/]+@)?github\.com(?::\d+)?/|[^@/\s]+@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?/?',
+                     (url or '').strip())
+    return f'{m.group(1)}/{m.group(2)}' if m else None
+
+
+def _folder_name(p):
+    """A cwd with no git repo behind it, named as a folder: its top folder under $HOME (`~/notes (folder)`, so
+    every project dir below it pools), else the path itself."""
+    home = str(Path.home())
+    if p == home: return '~ (folder)'
+    if p.startswith(home + os.sep): return f"~/{p[len(home) + 1:].split(os.sep, 1)[0]} (folder)"
+    return f'{p} (folder)'
+
+
+def session_repos(meta, registry=None, remote=None):
+    """{session: repo} for `scan_burn` meta. In order: a Codex session's recorded git remote; the git remote of the
+    cwd (so every worktree of a repo pools); a registry entry whose checkout or transcript dir holds the session;
+    the one repo its pr-links name. A cwd that is gone (a removed worktree) then takes the remote of its nearest
+    existing parent, else the one repo every resolved session under that parent maps to. Anything else is a folder:
+    its top folder under $HOME (`~/notes (folder)`) or its path, or `(no cwd)`. `remote`: cwd -> owner/name (default `remote_repo`)."""
+    remote = remote or (lambda cwd: remote_repo(cwd, timeout=GIT_TIMEOUT_S)); cache = {}
+
+    def by_cwd(cwd):
+        if cwd not in cache:
+            try: cache[cwd] = remote(cwd) if os.path.isdir(cwd) else None
+            except (OSError, subprocess.SubprocessError): cache[cwd] = None
+        return cache[cwd]
+    under = lambda p, root: p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+    trusted = [(os.path.abspath(os.path.expanduser(p)), repo) for repo, e in (registry or {}).items() for p in e.get('claude_project_dir') or ()]
+    out = {}; gone = {}
+    for sid, s in meta.items():
+        cwd = s.get('cwd'); repos = {r for r in s.get('repos') or () if isinstance(r, str)}
+        name = s.get('remote') or (by_cwd(cwd) if cwd else None)
+        if not name and cwd: name = next((r for p, r in trusted if under(cwd, p)), None)
+        if not name and s.get('dir'): name = next((r for p, r in trusted if p == os.path.abspath(s['dir'])), None)
+        if not name and len(repos) == 1: name = next(iter(repos))
+        if name: out[sid] = name
+        elif cwd and not os.path.isdir(cwd): gone[sid] = cwd
+        else: out[sid] = _folder_name(cwd) if cwd else '(no cwd)'
+    stops = {str(Path.home()), os.sep}
+    for sid, cwd in gone.items():
+        parent = os.path.dirname(cwd.rstrip(os.sep))
+        while parent and parent not in stops and not os.path.isdir(parent): parent = os.path.dirname(parent)
+        name = None
+        if parent and parent not in stops:
+            name = by_cwd(parent)
+            if not name:
+                found = {out[o] for o, s in meta.items() if o in out and s.get('cwd') and under(s['cwd'], parent) and '/' in out[o]
+                         and not out[o].startswith(('~', os.sep, '('))}
+                name = next(iter(found)) if len(found) == 1 else None
+        out[sid] = name or _folder_name(cwd)
+    return out
+
+
+def merged_by_repo(registry, extra=()):
+    """{owner/name: [merge times]} from each registry project's history.json (and `extra` (repo, data dir) pairs).
+    A missing or damaged history is skipped: merged PRs per session are then unknown for that repo."""
+    out = {}
+    for repo, d in [*((r, e.get('dir')) for r, e in (registry or {}).items()), *extra]:
+        if not repo or not d or repo in out: continue
+        try: hist = Store(os.path.expanduser(d)).read_json('history.json', None)
+        except (OSError, ValueError): continue
+        if isinstance(hist, list):
+            out[repo] = [t for p in hist if isinstance(p, dict) and (t := opt_utc(p.get('mergedAt')))]
+    return out
+
+
+def cache_saving(u, p):
+    """$ that cached reads saved: what they would have cost at the input price minus what they cost (same tier rule as message_cost)."""
+    prompt = u['input_tokens'] + u['cache_creation_input_tokens'] + u['cache_read_input_tokens']
+    if p.get('long_context') and prompt > p.get('long_context_threshold', float('inf')): p = p['long_context']
+    return u['cache_read_input_tokens'] * (p['input'] - p['cache_read']) / 1e6
+
+
+def usage_report(recs, meta, repos, now, days, prices, tz=None, idle_min=5.0, labels=True, merged=None):
+    """Spend analytics of the last `days` local days (today and the days before it) from `scan_burn` records.
+
+    `meta`/`repos`: `scan_burn` meta and `session_repos`. `merged`: `merged_by_repo`. Returns totals; cache tiles
+    (processed tokens, cached input share, uncached input = input + cache writes, output, savings); $ and tokens per
+    repo with sessions and merged PRs per session; the top sessions by $; the daily $ per agent and per model;
+    parallelism (median and p80 of sessions active per SLOT_MIN-minute slot, over slots with any activity, overall
+    and per day); and per model $, share, tokens and an approximate flag for tokens without a price."""
+    loc = now.astimezone(tz) if tz else now.astimezone()
+    first = (loc - timedelta(days=days - 1)).date()
+    # The first day's own midnight, with that day's UTC offset (DST): a given tz, else the system zone.
+    start = datetime(first.year, first.month, first.day, tzinfo=tz) if tz else datetime(first.year, first.month, first.day).astimezone()
+    local = lambda t: t.astimezone(tz) if tz else t.astimezone()
+    dates = [(first + timedelta(days=k)).isoformat() for k in range(days)]
+    fams = {}; total = {'usd': 0.0, 'tokens': 0, 'unpriced_tokens': 0, 'responses': 0, 'unpriced_responses': 0}
+    cache = {'input': 0, 'cache_write': 0, 'cache_read': 0, 'output': 0, 'savings_usd': 0.0}
+    by_repo = defaultdict(lambda: {'usd': 0.0, 'tokens': 0, 'unpriced_tokens': 0, 'sessions': set()})
+    by_model = defaultdict(lambda: {'usd': 0.0, 'tokens': 0, 'unpriced_tokens': 0, 'priced': 0, 'unpriced': 0})
+    sess = defaultdict(lambda: {'usd': 0.0, 'tokens': 0, 'start': None, 'models': Counter()})
+    daily = {d: {'agents': defaultdict(float), 'models': defaultdict(float), 'tokens': 0} for d in dates}
+    stamps = defaultdict(list)
+    for r in recs:
+        ts, agent, model, tokens, usd = r[:5]
+        if not start <= ts <= now or local(ts).date().isoformat() not in daily: continue
+        u = r[7] if len(r) > 7 else None; home = r[8] if len(r) > 8 else (r[5] if isinstance(r[5], str) else r[5][0])
+        sid = session_key(home); repo = repos.get(sid, '(no cwd)'); day = local(ts).date().isoformat(); m = model or 'unknown'
+        total['responses'] += 1; total['tokens'] += tokens
+        x = by_repo[repo]; x['tokens'] += tokens; x['sessions'].add(sid)
+        y = by_model[m]; y['tokens'] += tokens
+        s = sess[sid]; s['tokens'] += tokens; s['agent'] = agent; s['repo'] = repo
+        s['start'] = ts if s['start'] is None or ts < s['start'] else s['start']
+        daily[day]['tokens'] += tokens; stamps[sid].append(ts)
+        if usd is None:
+            total['unpriced_tokens'] += tokens; x['unpriced_tokens'] += tokens; y['unpriced_tokens'] += tokens; s['models'][m] += 0
+            total['unpriced_responses'] += 1; y['unpriced'] += 1
+        else:
+            y['priced'] += 1; total['usd'] += usd; x['usd'] += usd; y['usd'] += usd; s['usd'] += usd; s['models'][m] += usd
+            daily[day]['agents'][agent] += usd; daily[day]['models'][m] += usd
+        if u and not u.get('usage_missing'):
+            cache['input'] += u['input_tokens']; cache['cache_write'] += u['cache_creation_input_tokens']
+            cache['cache_read'] += u['cache_read_input_tokens']; cache['output'] += u['output_tokens']
+            fam = fams[model] if model in fams else fams.setdefault(model, model_family(model, prices))
+            if fam and u['cache_read_input_tokens']: cache['savings_usd'] += cache_saving(u, prices[fam])
+    prompt = cache['input'] + cache['cache_write'] + cache['cache_read']
+    cache.update(processed=prompt + cache['output'], uncached_input=cache['input'] + cache['cache_write'],
+                 cached_share=cache['cache_read'] / prompt if prompt else None)
+    merged = merged or {}
+    repo_rows = []
+    for repo, x in sorted(by_repo.items(), key=lambda kv: (-kv[1]['usd'], -kv[1]['tokens'], kv[0])):
+        n = len(x['sessions']); prs = None
+        if repo in merged: prs = sum(1 for t in merged[repo] if start <= t <= now)
+        repo_rows.append({'repo': repo, 'usd': x['usd'], 'tokens': x['tokens'], 'unpriced_tokens': x['unpriced_tokens'], 'sessions': n,
+                          'prs': prs, 'prs_per_session': prs / n if prs is not None and n else None})
+    top = sorted(sess.items(), key=lambda kv: (-kv[1]['usd'], -kv[1]['tokens'], kv[0]))[:TOP_SESSIONS]
+    sessions = [{'start': iso(s['start']), 'agent': s['agent'], 'model': s['models'].most_common(1)[0][0] if s['models'] else None,
+                 'repo': s['repo'], 'usd': s['usd'], 'tokens': s['tokens'],
+                 'label': ((meta or {}).get(sid) or {}).get('label') if labels else None} for sid, s in top]
+    slots = defaultdict(set); gap = idle_min * 60; width = SLOT_MIN * 60
+    for sid, ts_list in stamps.items():
+        ts_list.sort()
+        for t in ts_list: slots[int(t.timestamp() // width)].add(sid)
+        for a, b in zip(ts_list, ts_list[1:]):
+            if 0 < (b - a).total_seconds() <= gap:
+                for k in range(int(a.timestamp() // width), int(b.timestamp() // width) + 1): slots[k].add(sid)
+    per_day = defaultdict(list)
+    for k, ss in slots.items(): per_day[local(datetime.fromtimestamp(k * width, timezone.utc)).date().isoformat()].append(len(ss))
+    counts = [len(ss) for ss in slots.values()]
+    known = [r for r in repo_rows if r['prs'] is not None]
+    prs, n_known = sum(r['prs'] for r in known), sum(r['sessions'] for r in known)
+    parallel = {'median': percentile(counts, .5), 'p80': percentile(counts, .8), 'slots': len(counts),
+                'usually': max(round(percentile(counts, .5)), 1) if counts else None,
+                'days': [{'date': d, 'median': percentile(per_day[d], .5), 'p80': percentile(per_day[d], .8), 'peak': max(per_day[d])}
+                         for d in dates if per_day.get(d)],
+                'prs': prs if known else None, 'sessions': n_known if known else None,
+                'prs_per_session': prs / n_known if known and n_known else None}
+    models = [{'model': m, 'usd': y['usd'] if y['priced'] else None,
+               'share': y['usd'] / total['usd'] if total['usd'] else None, 'tokens': y['tokens'],
+               'approximate': y['unpriced'] > 0, 'unpriced_tokens': y['unpriced_tokens']}
+              for m, y in sorted(by_model.items(), key=lambda kv: (-kv[1]['usd'], -kv[1]['tokens'], kv[0]))]
+    return {'days': days, 'start': iso(start), 'end': iso(now), 'basis': PRICING_BASIS, 'labels': labels,
+            'total': {**total, 'sessions': len(sess), 'approximate': total['unpriced_responses'] > 0},
+            'cache': cache, 'repos': repo_rows, 'sessions': sessions,
+            'daily': [{'date': d, 'agents': dict(daily[d]['agents']), 'models': dict(daily[d]['models']), 'tokens': daily[d]['tokens']}
+                      for d in dates],
+            'parallel': parallel, 'models': models}
+
+
+AGENT_NAMES = {'claude-code': 'Claude Code', 'codex': 'Codex'}
+
+
+def _short_model(m):
+    return (m or 'unknown').removeprefix('claude-')
+
+
+def _day(d):
+    d = datetime.fromisoformat(d) if isinstance(d, str) else d
+    return f'{d.day} {d:%b}'
+
+
+def usage_lines(rep):
+    """`estimate usage` text from `usage_report`."""
+    t, c, p = rep['total'], rep['cache'], rep['parallel']; days = rep['days']
+    first, last = rep['daily'][0]['date'], rep['daily'][-1]['date']
+    approx = f" · approximate: {_tok(t['unpriced_tokens'])} tokens have no price" if t['approximate'] else ''
+    out = [f"Usage, last {days} days ({_day(first)} – {_day(last)}): every local Claude Code and Codex log",
+           f"Spend {_usd(t['usd'])} · {_tok(t['tokens'])} tokens · {t['sessions']} session{'s' if t['sessions'] != 1 else ''}{approx}",
+           f"  ({rep['basis']})", '']
+    if not t['responses']:
+        return out + ['No agent responses in this period.']
+    share = f"{c['cached_share'] * 100:.0f}%" if c['cached_share'] is not None else '–'
+    out += ['Cache',
+            f"  processed tokens  {_tok(c['processed'])}",
+            f"  cached input      {share} of input ({_tok(c['cache_read'])} read from cache)",
+            f"  uncached input    {_tok(c['uncached_input'])} (input {_tok(c['input'])} + cache writes {_tok(c['cache_write'])})",
+            f"  output            {_tok(c['output'])}",
+            f"  cache savings     {_usd(c['savings_usd'])} (cached reads at the input price minus what they cost)", '']
+    rows = rep['repos']; shown = rows[:TOP_REPOS]; rest = rows[TOP_REPOS:]
+    w = max([len(r['repo']) for r in shown] + [10])
+    w = min(w, 44)
+    out.append(f"{'By repo':<{w + 2}}{'$':>9}  {'tokens':>8}  {'sessions':>8}  PRs/session")
+    for r in shown:
+        name = r['repo'] if len(r['repo']) <= w else '…' + r['repo'][-(w - 1):]
+        pps = f"{r['prs_per_session']:.2f} ({r['prs']} PRs)" if r['prs_per_session'] is not None else '–'
+        out.append(f"  {name:<{w}}{_usd(r['usd']):>9}  {_tok(r['tokens']):>8}  {r['sessions']:>8}  {pps}")
+    if rest:
+        out.append(f"  {f'{len(rest)} more':<{w}}{_usd(sum(r['usd'] for r in rest)):>9}  {_tok(sum(r['tokens'] for r in rest)):>8}  "
+                   f"{sum(r['sessions'] for r in rest):>8}")
+    out += ['', f"Top {len(rep['sessions'])} sessions by $"]
+    for s in rep['sessions']:
+        when = _day(utc(s['start']).astimezone().date())
+        label = f"  “{s['label']}”" if s['label'] else ''
+        out.append(f"  {when:>6}  {AGENT_NAMES.get(s['agent'], s['agent']):<11}  {_short_model(s['model']):<16}  {_usd(s['usd']):>8}  "
+                   f"{s['repo']}{label}")
+    out += ['', f'Daily $ ({"per week" if days > 30 else "per day"}): Claude Code █  Codex ░']
+    daily = rep['daily']
+    buckets = ([(f"{_day(daily[k]['date'])}", daily[k:k + 7]) for k in range(0, len(daily), 7)] if days > 30
+               else [(_day(d['date']), [d]) for d in daily])
+    sums = [(label, sum(d['agents'].get('claude-code', 0) for d in ds), sum(v for d in ds for a, v in d['agents'].items() if a != 'claude-code'))
+            for label, ds in buckets]
+    top_usd = max((a + b for _, a, b in sums), default=0) or 1
+    for label, a, b in sums:
+        bar = '█' * round(a / top_usd * 40) + '░' * round(b / top_usd * 40)
+        out.append(f"  {label:>6}  {_usd(a + b):>8}  {bar}")
+    if p['slots']:
+        prs = (f" · merged PRs per session {p['prs_per_session']:.2f} ({p['prs']} PRs / {p['sessions']} sessions in repos with history)"
+               if p['prs_per_session'] is not None else '')
+        out += ['', f"Parallel sessions: median {_num(p['median'])}, p80 {_num(p['p80'])} over {p['slots']} active "
+                    f"{SLOT_MIN}-minute slots · you usually run ~{p['usually']}{prs}"]
+    out += ['', f"{'Models':<30}{'$':>9}  {'share':>6}  {'tokens':>8}"]
+    for m in rep['models']:
+        usd = _usd(m['usd']) if m['usd'] is not None else '–'
+        share = f"{m['share'] * 100:.0f}%" if m['share'] and m['usd'] is not None else '–'
+        flag = '  approximate: no price' if m['usd'] is None else (f"  approximate: {_tok(m['unpriced_tokens'])} unpriced" if m['approximate'] else '')
+        out.append(f"  {_short_model(m['model']):<28}{usd:>9}  {share:>6}  {_tok(m['tokens']):>8}{flag}")
+    return out
+
+
+def labels_on(args, cfg):
+    """Session labels are shown unless --no-labels or `"session_labels": false` in the data dir's config.json."""
+    return not getattr(args, 'no_labels', False) and not (isinstance(cfg, dict) and cfg.get('session_labels') is False)
+
+
+def usage_inputs(args, now, days, prices, limits=None, labels=True):
+    """(records, meta, session repos, merged times) for the last `days` days: one transcript scan, the registry and histories."""
+    meta = {}
+    recs = scan_burn(args.claude_dir, args.codex_dir, now - timedelta(days=days), prices, limits, meta, labels)
+    reg = read_registry(); r = resolve(args)
+    repos = session_repos(meta, reg)
+    merged = merged_by_repo(reg, [(r['repo'], r['dir'])] if r.get('repo') and r.get('dir') else ())
+    return recs, meta, repos, merged
+
+
+def cmd_usage(args):
+    now = utc(args.now) if args.now else datetime.now(timezone.utc)
+    d = resolve(args)['dir']; cfg = _quiet_config(d); prices = Store(d).prices() if d else DEFAULT_PRICES
+    labels = labels_on(args, cfg)
+    recs, meta, repos, merged = usage_inputs(args, now, args.days, prices, labels=labels)
+    rep = usage_report(recs, meta, repos, now, args.days, prices, idle_min=args.idle_min, labels=labels, merged=merged)
+    print(json.dumps(rep, indent=1, ensure_ascii=False) if args.json else '\n'.join(usage_lines(rep)))
+    return rep
 
 
 # ---------- plan windows: status-line snapshots ----------
@@ -2198,6 +2750,330 @@ def tier_of(index, s):
     return next((t for t, _ in TIERS if index < s[t]['cards']), None)
 
 
+# ---------- critical-chain plan ----------
+
+PLAN_RUNS = 500         # Monte Carlo runs of the list scheduler
+PLAN_MAX_AGENTS = 8     # agent counts tried for the "max useful agents" line
+USEFUL_GAIN = .05       # one more agent that saves less than this share of the p50 finish is not useful
+AHEAD_CARDS = 20        # cards on the dashboard's Ahead timeline
+_LANE_LINE = re.compile(r'^\s*[-*]\s*`?([^\s`(:]+)`?\s*[(:]\s*(?:(open|merging)\s+)?cap\s*(\d+)', re.I)
+
+
+def _cap(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 1 else None
+
+
+def lane_caps(text, config=None):
+    """({lane: {'open': n or None, 'merging': n or None}}, problems) from a `## Lanes` section of the backlog
+    file (`- migration (cap 1): …`, `- bot.py (merging cap 1)`) and `lanes` in config.json
+    (`{"bot.py": {"open": 1}, "migration": {"merging": 1}}`, or `{"ci": 1}` for open); config wins per lane.
+
+    `open`: cards of the lane started and not yet merged at once. `merging`: cards in their merge wait at once;
+    their work may overlap. A lane without a cap, and a card without a lane, run in parallel without limit."""
+    caps, problems, inside = {}, [], False
+    for line in (text or '').splitlines():
+        if m := re.match(r'^\s*#{1,6}\s+(.*?)\s*$', line):
+            inside = m.group(1).lower().startswith('lanes'); continue
+        if inside and (m := _LANE_LINE.match(line)) and _cap(int(m.group(3))):
+            caps[m.group(1)] = {'open': None, 'merging': None, (m.group(2) or 'open').lower(): int(m.group(3))}
+    lanes = config.get('lanes') if isinstance(config, dict) else None
+    if lanes is not None and not isinstance(lanes, dict):
+        problems.append('config.json: lanes must be {"lane": {"open": 1}} or {"lane": 1}; ignored'); lanes = {}
+    for name, v in (lanes or {}).items():
+        if _cap(v): caps[name] = {'open': v, 'merging': None}
+        elif isinstance(v, dict) and v and set(v) <= {'open', 'merging'} and all(_cap(x) or x is None for x in v.values()):
+            caps[name] = {'open': v.get('open'), 'merging': v.get('merging')}
+        else: problems.append(f'config.json: lane {name!r} needs a whole number ≥ 1 for "open" and/or "merging"; ignored')
+    return caps, problems
+
+
+def commit_times(store):
+    """PR number -> commit times from history.json, for merge waits."""
+    return {p['number']: [t for c in p.get('commits') or [] if (t := opt_utc(c.get('authoredDate')))]
+            for p in store.read_json('history.json', []) if p.get('number') is not None}
+
+
+def plan_samples(rows, cal, commits=None):
+    """Per merged PR of the calibration window: (work hours per SP, merge wait hours), and the gap factor.
+
+    Merge wait: the PR's last commit to its merge (review and CI tail; 0 without commit times). Work: the rest
+    of start→merge. A PR whose measured start is its last commit (one commit, no earlier agent log) has no
+    measurable split: its whole start→merge time counts as work, so card time still grows with SP. Gap factor: the window's calendar hours since the first merge ÷ hours with at least one PR
+    in flight. It turns one PR's elapsed hours into an agent's calendar hours (pauses, planning, the owner's
+    day), so that as many agents as the repo had PRs in flight reproduce its measured pace."""
+    if not cal: return {'pairs': [], 'gap': 1.0}
+    a, b = utc(cal['window']['start']), utc(cal['window']['end'])
+    pairs, spans = [], []
+    for r in one_per_pr([r for r in settled(rows) if a <= utc(r['actual']['merged_at']) <= b]):
+        x = r['actual']; merged = utc(x['merged_at']); wall = max(x.get('wall_h') or 0.0, 0.0)
+        last = max((t for t in (commits or {}).get(x['pr'], []) if t <= merged), default=None)
+        wait = min(max(hours(last, merged), 0.0), wall) if last else 0.0
+        if wall - wait <= .01 * wall: wait = 0.0
+        pairs.append(((wall - wait) / r['sp'], wait))
+        if x.get('start_at'): spans.append((utc(x['start_at']), merged))
+    t0 = utc(((cal.get('throughput') or {}).get('start')) or cal['window']['start'])
+    busy = union_hours(sorted(spans))
+    return {'pairs': pairs, 'gap': max(hours(t0, b) / busy, 1.0) if busy > 0 else 1.0}
+
+
+def plan_scope(items, unsized=()):
+    """(cards to plan in Score order with dependencies first, excluded [{'id', 'label', 'reason'}], warnings).
+
+    Excluded, never planned: a card with an unknown or unsized dependency, in a dependency cycle, or waiting
+    on an excluded card. A repeated id is planned once."""
+    ordered, warnings = order_backlog(items, unsized)
+    known, skipped = {i['id'] for i in items}, {u['id']: u for u in unsized}
+    label = {i['id']: i.get('label') or i['id'] for i in list(reversed(ordered)) + list(unsized)}
+    loop = set(critical_path(items)['cycle'])
+    ok, out, excluded = set(), [], []
+    for it in ordered:
+        if it['id'] in ok: continue
+        bad = [d for d in dict.fromkeys(it.get('depends') or []) if d not in ok]
+        if not bad:
+            ok.add(it['id']); out.append(it); continue
+        if gone := [d for d in bad if d in skipped]: why = 'depends on unsized ' + ', '.join('#' + label[d] for d in gone)
+        elif gone := [d for d in bad if d not in known]: why = 'depends on unknown ' + ', '.join('#' + d for d in gone)
+        elif it['id'] in loop: why = 'in a dependency cycle'
+        else: why = 'waits for excluded ' + ', '.join('#' + label.get(d, d) for d in bad)
+        excluded.append({'id': it['id'], 'label': label[it['id']], 'reason': why})
+    return out, excluded, warnings
+
+
+def _cpm(cards, deps, dur):
+    """Resource-free critical path at fixed durations: (late start per card, chain indices, length).
+    `cards` are in dependency order; ties prefer the earlier card."""
+    n = len(cards); es, ef = [0.0] * n, [0.0] * n; dependents = defaultdict(list)
+    for i in range(n):
+        es[i] = max((ef[j] for j in deps[i]), default=0.0); ef[i] = es[i] + dur[i]
+        for j in deps[i]: dependents[j].append(i)
+    end = max(ef, default=0.0); ls = [0.0] * n
+    for i in reversed(range(n)):
+        ls[i] = min((ls[j] for j in dependents[i]), default=end) - dur[i]
+    chain, i = [], max(range(n), key=lambda k: (ef[k], -k)) if n else None
+    while i is not None:
+        chain.append(i); i = max(deps[i], key=lambda k: (ef[k], -k)) if deps[i] else None
+    return ls, chain[::-1], end
+
+
+def _plan_run(deps, dependents, work, wait, agents, lanes, caps, late, rank):
+    """One run of the list scheduler: free agents take ready cards (every dependency merged, lane under its
+    `open` cap) by priority: a card past its late start first (it would slip the end), then Score order.
+    Work ends, the agent moves on, the card waits to merge (a `merging` cap queues it). Returns per card
+    (start, work end, merged, agent), hours from now."""
+    n = len(work); t = 0.0; left = [len(d) for d in deps]; ready = [i for i in range(n) if not left[i]]
+    opened, merging, queue = Counter(), Counter(), defaultdict(list)
+    idle = list(range(agents)); ev, seq = [], 0
+    start, worked, done, who = [0.0] * n, [0.0] * n, [0.0] * n, [0] * n
+
+    def push(at, kind, i):
+        nonlocal seq
+        heapq.heappush(ev, (at, kind, seq, i)); seq += 1
+
+    def merge(i, at):
+        if lanes[i]: merging[lanes[i]] += 1
+        push(at + wait[i], 1, i)
+    while True:
+        if idle and ready:
+            for i in sorted(ready, key=lambda i: (0, late[i], rank[i]) if t >= late[i] - 1e-9 else (1, 0, rank[i])):
+                if not idle: break
+                cap = (caps.get(lanes[i]) or {}).get('open') if lanes[i] else None
+                if cap and opened[lanes[i]] >= cap: continue
+                ready.remove(i)
+                if lanes[i]: opened[lanes[i]] += 1
+                who[i] = heapq.heappop(idle); start[i] = t; push(t + work[i], 0, i)
+        if not ev: break
+        t = ev[0][0]
+        while ev and ev[0][0] <= t:  # every event at this time first, a zero merge wait included, then dispatch
+            _, kind, _, i = heapq.heappop(ev); lane = lanes[i]
+            if kind == 0:
+                worked[i] = t; heapq.heappush(idle, who[i])
+                cap = (caps.get(lane) or {}).get('merging') if lane else None
+                if cap and merging[lane] >= cap: queue[lane].append(i)
+                else: merge(i, t)
+            else:
+                done[i] = t
+                if lane:
+                    opened[lane] -= 1; merging[lane] -= 1
+                    if queue[lane] and (caps.get(lane) or {}).get('merging'): merge(queue[lane].pop(0), t)
+                for j in dependents[i]:
+                    left[j] -= 1
+                    if not left[j]: ready.append(j)
+    return start, worked, done, who
+
+
+def _a(n):
+    """`a 4th`, `an 8th`, `an 11th`."""
+    return ('an ' if str(n).startswith('8') or n in (11, 18) or 80 <= n < 90 else 'a ') + _ordinal(n)
+
+
+def _ordinal(n):
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def plan_forecast(items, unsized, rows, cal, commits=None, caps=None, agents=3, top=None, runs=PLAN_RUNS, seed=1):
+    """Critical-chain forecast of the backlog: Monte Carlo of a list scheduler with K agents and lane caps.
+
+    Card time = SP × a work rate per SP drawn from the window's merged PRs (two-level bootstrap, as in
+    `simulate_backlog`) × the gap factor (`plan_samples`), then that PR's merge wait. Per K: p20/p50/p80
+    finish of each card and of the scope, the project buffer (p80 − p50 at the end; no per-card padding), and
+    the lanes and waves of the run that ends nearest the p50. Also the critical chain (the longest dependency chain at
+    median card times), waves (dependency levels), blocked cards and the max useful agent count. Times are
+    hours from now. Without measured PRs only the order, waves and chain in SP come back."""
+    if not isinstance(runs, int) or isinstance(runs, bool) or runs <= 0: raise ValueError('runs must be a positive integer')
+    unsized = list(unsized or []); caps = caps or {}
+    scope, excluded, warnings = plan_scope(items, unsized)
+    total = len(scope)
+    if top: scope = scope[:top]
+    index = {c['id']: k for k, c in enumerate(scope)}
+    deps = [[index[d] for d in dict.fromkeys(c.get('depends') or []) if d in index] for c in scope]
+    dependents = defaultdict(list)
+    for i, d in enumerate(deps):
+        for j in d: dependents[j].append(i)
+    label = lambda i: scope[i].get('label') or scope[i]['id']
+    lanes = [c.get('lane') or '' for c in scope]
+    samples = plan_samples(rows, cal, commits); pairs, gap = samples['pairs'], samples['gap']
+    rank_key = lambda i: (scope[i]['score'] is None, -(scope[i]['score'] or 0), i)
+    out = {'cards': [], 'excluded': excluded, 'unsized': [u.get('label') or u['id'] for u in unsized], 'warnings': warnings,
+           'of': total, 'top': top if top and top < total else None, 'sp': sum(c['sp'] for c in scope),
+           'n': len(pairs), 'rough': len(pairs) < MIN_INTERVAL_N, 'gap': round(gap, 2), 'runs': runs, 'seed': seed,
+           'no_depends': not any(deps), 'maybe_done': [label(i) for i in range(len(scope)) if maybe_done(scope[i])],
+           'lanes': {k: v for k, v in caps.items() if k in set(lanes)}, 'agents': {}, 'chosen': agents}
+    blockers = Counter(j for d in deps for j in d)
+    if not pairs: dur = [float(c['sp']) for c in scope]  # no measured pace: SP stand in for time
+    else:
+        med = {sp: statistics.median(sp * w * gap + x for w, x in pairs) for sp in {c['sp'] for c in scope}}
+        dur = [med[c['sp']] for c in scope]
+    late, chain, length = _cpm(scope, deps, dur)
+    if not any(deps): late, chain, length = [math.inf] * len(scope), [], 0.0  # no dependencies: Score order only
+    on_chain = set(chain)
+    order = sorted(range(len(scope)), key=lambda i: (rank_key(i)[0], rank_key(i)[1], i not in on_chain, i))
+    rank = [0] * len(scope)
+    for r, i in enumerate(order): rank[i] = r
+    out['chain'] = {'ids': [scope[i]['id'] for i in chain], 'labels': [label(i) for i in chain],
+                    'sp': sum(scope[i]['sp'] for i in chain), ('hours' if pairs else 'sp_length'): length}
+    for i, c in enumerate(scope):
+        out['cards'].append({'id': c['id'], 'label': label(i), 'title': c['title'], 'sp': c['sp'], 'score': c['score'],
+                             'lane': lanes[i], 'chain': i in on_chain, 'depends': [scope[j]['id'] for j in deps[i]],
+                             'unblocks': blockers[i], 'maybe_done': maybe_done(c)})
+    out['blocked'] = [{'id': scope[i]['id'], 'label': label(i), 'waits_for': [label(j) for j in deps[i]]} for i in range(len(scope)) if deps[i]]
+    if not scope: return out
+    ks = sorted(set(range(1, PLAN_MAX_AGENTS + 1)) | set(PARALLEL) | {agents})
+    def lanes_of(k, work, wait):
+        """One run's lanes and waves: a new wave starts, in start order, at a card that needs one of the current wave."""
+        start, worked, done, who = _plan_run(deps, dependents, work, wait, k, lanes, caps, late, rank)
+        sched, waves, cur = [], [], []
+        for i in range(len(scope)):
+            last = max(deps[i], key=lambda j: done[j]) if deps[i] else None
+            sched.append({'id': scope[i]['id'], 'agent': who[i] + 1, 'start': start[i], 'worked': worked[i], 'merged': done[i],
+                          'waits_for': label(last) if last is not None else None})
+        for i in sorted(range(len(scope)), key=lambda i: (start[i], who[i])):
+            if cur and any(j in cur for j in deps[i]): waves.append(cur); cur = []
+            cur.append(i)
+        return {'schedule': sched, 'waves': [{'ids': [scope[i]['id'] for i in w]} for w in waves + [cur]]}
+    if not pairs:  # no measured pace: one run with SP as time and no merge waits
+        out['agents'] = {k: lanes_of(k, dur, [0.0] * len(scope)) for k in ks}
+        return out
+    rng = random.Random(seed); ends = {k: [] for k in ks}; finish = {k: [[] for _ in scope] for k in ks}; draws = []
+    for _ in range(runs):
+        hist = rng.choices(pairs, k=len(pairs)); draw = [rng.choice(hist) for _ in scope]
+        work = [c['sp'] * w * gap for c, (w, _) in zip(scope, draw)]; wait = [x for _, x in draw]
+        draws.append((work, wait))
+        for k in ks:
+            done = _plan_run(deps, dependents, work, wait, k, lanes, caps, late, rank)[2]
+            ends[k].append(max(done))
+            for i, t in enumerate(done): finish[k][i].append(t)
+    q = lambda xs: {'p20': percentile(xs, .2), 'p50': percentile(xs, .5), 'p80': percentile(xs, .8)}
+    for k in ks:
+        end = q(ends[k])
+        # The lanes show the run that ends closest to the p50 finish: a real run, not a sum of medians.
+        r50 = min(range(runs), key=lambda r: (abs(ends[k][r] - end['p50']), r))
+        a = out['agents'][k] = {**lanes_of(k, *draws[r50]), 'end': end, 'buffer': end['p80'] - end['p50'],
+                                'cards': {scope[i]['id']: q(finish[k][i]) for i in range(len(scope))}}
+        upto = [0.0] * runs  # a wave's date: it and every earlier wave merged, so dates never go back
+        for w in a['waves']:
+            ix = [index[x] for x in w['ids']]
+            upto = [max(upto[r], *(finish[k][i][r] for i in ix)) for r in range(runs)]
+            w.update(q(upto))
+    p50 = {k: out['agents'][k]['end']['p50'] for k in ks}
+    # None: even the largest count tried still gains USEFUL_GAIN or more from one more agent
+    out['useful'] = next((k for k in ks if k + 1 in p50 and p50[k] - p50[k + 1] < USEFUL_GAIN * p50[k]), None)
+    out['searched'] = max(k for k in ks if k - 1 in p50)
+    out['saves'] = {k: p50[k] - p50[k + 1] for k in ks if k + 1 in p50}
+    return out
+
+
+def _date(now, h, tz=None):
+    d = (now + timedelta(hours=h)).astimezone(tz) if tz else (now + timedelta(hours=h)).astimezone()
+    return f'{d:%b} {d.day}'
+
+
+def _saving(h, p50):
+    """Hours one more agent saves, as days; under 0.1 d or 1% of the finish it is noise: `nothing`."""
+    return 'nothing' if h < max(2.4, .01 * p50) else f'{_num(h / 24)} d'
+
+
+def agents_line(plan, k, now, tz=None):
+    """`3 agents: done ~Nov 6 (p80 Nov 12); a 4th saves 0.5 d; a 5th saves nothing`."""
+    a = plan['agents'][k]; e = a['end']; out = f"{_agents(k)}: done ~{_date(now, e['p50'], tz)} (p80 {_date(now, e['p80'], tz)})"
+    for m in (k + 1, k + 2):
+        if m - 1 in plan['saves']: out += f"; {_a(m)} saves {_saving(plan['saves'][m - 1], plan['agents'][m - 1]['end']['p50'])}"
+    return out
+
+
+def plan_lines(plan, now, tz=None, cal=None):
+    """The short text of `estimate plan`."""
+    tag = lambda x: '#' + x
+    cards = plan['cards']; k = plan['chosen']; label = {c['id']: c['label'] for c in cards}
+    scope = f"{len(cards)} cards, {plan['sp']} SP" + (f" (top {plan['top']} of {plan['of']} in Score order, dependencies first)" if plan['top'] else '')
+    out = [f'plan: {scope}' + (f"; {plan['n']} measured PRs" + (', rough' if plan['rough'] else '') if plan['n'] else '')]
+    warn = []
+    if plan['unsized']: warn.append(f"skipped {len(plan['unsized'])} unsized card(s), not planned: {_short_list([tag(x) for x in plan['unsized']])}")
+    for x in plan['excluded']: warn.append(f"#{x['label']} not planned: {x['reason']}")
+    warn += [w for w in plan['warnings'] if w.startswith('duplicate id')]
+    if plan['maybe_done']: warn.append(f"{len(plan['maybe_done'])} of the planned cards may already be done (Tiden links merged code): "
+                                       f"{_short_list([tag(x) for x in plan['maybe_done']])}")
+    if plan['no_depends'] and cards: warn.append('no dependencies given, order is Score only')
+    if not cards:
+        return out + [f'  warning: {w}' for w in warn] + ['  nothing to plan']
+    if plan['agents'] and 'end' in plan['agents'][k]:
+        for a in sorted(set(PARALLEL) | {k}): out.append('  ' + agents_line(plan, a, now, tz))
+        u = plan['useful']
+        out.append(f"  max useful agents: {u} ({_a(u + 1)} saves under {USEFUL_GAIN:.0%})" if u else
+                   f"  max useful agents: over {plan['searched'] - 1} ({_a(plan['searched'])} still saves {USEFUL_GAIN:.0%} or more; not searched further)")
+        out.append(f"  project buffer, {_agents(k)}: {_num(plan['agents'][k]['buffer'] / 24)} d (p80 − p50 at the end; no per-card padding)")
+    else: out.append('  no measured PRs yet: order, waves and chain in SP only; dates come after `estimate record` settles merged PRs')
+    ch = plan['chain']
+    length = f"≈{_num(ch['hours'] / 24)} d at median card times" if 'hours' in ch else f"{ch['sp']} SP"
+    if ch['labels']:
+        out.append(f"critical chain: {len(ch['labels'])} card{'s' if len(ch['labels']) != 1 else ''}, {ch['sp']} SP, {length}: "
+                   + ' → '.join(tag(x) for x in ch['labels']))
+    else: out.append('critical chain: none (no dependencies)')
+    a = plan['agents'].get(k)
+    if a:
+        out.append(f"waves, {_agents(k)} (start order; a new wave starts at a card that needs the last one"
+                   + ('; date = it and all earlier waves merged, p50 / p80' if 'end' in a else '') + '):')
+        groups = []  # waves next to each other with the same dates print as one line (`6–17.`)
+        for n, w in enumerate(a['waves'], 1):
+            when = f"{_date(now, w['p50'], tz)} / {_date(now, w['p80'], tz)}  " if 'p50' in w else ''
+            if groups and when and groups[-1][2] == when: groups[-1][1] = n; groups[-1][3] += w['ids']
+            else: groups.append([n, n, when, list(w['ids'])])
+        for first, last, when, ids in groups:
+            out.append(f"  {first}{f'–{last}' if last != first else ''}. {when}{len(ids)} card{'s' if len(ids) != 1 else ''}: "
+                       + _short_list([tag(label[x]) for x in ids], 10))
+    if plan['blocked']:
+        top = sorted((c for c in cards if c['unblocks']), key=lambda c: -c['unblocks'])[:3]
+        out.append(f"blocked now: {len(plan['blocked'])} card{'s wait' if len(plan['blocked']) != 1 else ' waits'} for others; most waited on: "
+                   + ', '.join(f"#{c['label']} ({c['unblocks']})" for c in top))
+    if plan['lanes']:
+        out.append('lanes: ' + ', '.join(f"{n} " + ' '.join(f'{kind} ≤{v}' for kind, v in cap.items() if v) for n, cap in plan['lanes'].items()))
+    out += [f'  warning: {w}' for w in warn]
+    if plan['n']:
+        out.append(f"based on: card time = SP × a work rate per SP drawn from {plan['n']} merged PRs × {_num(plan['gap'])} (calendar hours per "
+                   f"hour with a PR in flight) + that PR's merge wait; {plan['runs']} runs, seed {plan['seed']}; "
+                   'chain cards first when they would slip the end, otherwise Score order')
+    return out
+
+
 # ---------- dashboard ----------
 
 CSS = """
@@ -2402,7 +3278,237 @@ def window_cards(win, now, tz=None):
     return out
 
 
-def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=None, tz=None, windows=None, subs=()):
+AHEAD_CSS = """
+.ahead{margin-top:40px;border-top:1px solid var(--line);padding-top:14px}
+.ahead .head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.ahead .head h2{margin:0}
+.ahead .line{margin-top:10px;max-width:none}
+.card.cc{--tier:var(--violet);color:var(--sel-ink);font-weight:600}
+.card.wt{opacity:.55}.card.cc.wt{opacity:.8}
+.card.mw{top:auto;bottom:2px;height:5px;border-radius:2px;padding:0;background:repeating-linear-gradient(135deg,var(--muted) 0 2px,transparent 2px 5px)}
+.track.buf{height:14px;background:transparent}
+.track.buf i{position:absolute;top:3px;bottom:3px;left:calc((100% - 6px) * var(--l) + 3px);width:calc((100% - 6px) * var(--w));
+border-radius:4px;background:repeating-linear-gradient(135deg,color-mix(in oklab,var(--coral) 70%,transparent) 0 4px,transparent 4px 8px);
+border:1px solid var(--coral)}
+.ahead .waits{margin-top:10px;color:var(--muted);font-size:13px;max-width:90ch}
+.ahead .waits b{font-weight:500;color:var(--ink)}
+"""
+
+
+def ahead_css(own_radios):
+    """The Ahead section follows the planner's agent radios; with no planner on the page it has its own."""
+    out = [f'#ag-{a}:checked~main .v.ah{a}{{display:revert}}' for a in PARALLEL]
+    if own_radios:
+        out += [f'#ag-{a}:checked~main label[for=ag-{a}]{{--on:1;color:var(--ink)}}'
+                f'#ag-{a}:focus-visible~main label[for=ag-{a}]{{outline:2px solid var(--focus);outline-offset:2px}}' for a in PARALLEL]
+    return AHEAD_CSS + '\n'.join(out)
+
+
+def ahead_html(plan, now, tz=None, switch=''):
+    """The Ahead section: the plan's cards in agent lanes for each agent count in PARALLEL (the run
+    ending nearest the p50), the critical chain in the accent colour, cards that wait for another one dimmed, the merge wait
+    hatched, the p50 marker and the p80 buffer bar, and the diminishing-returns line. '' without a schedule."""
+    e = html.escape
+    if not plan or not plan.get('cards') or not plan['agents']: return ''
+    cards = {c['id']: c for c in plan['cards']}; dated = 'end' in plan['agents'][PARALLEL[0]]
+    notes = []
+    if plan['no_depends']: notes.append('No dependencies given, order is Score only.')
+    if plan['rough'] and dated: notes.append(f"Rough: {_prs(plan['n'])} measured; dates firm up as PRs merge.")
+    if not dated: notes.append('No measured PRs yet: lanes in SP, no dates.')
+    if plan['excluded']: notes.append(f"{len(plan['excluded'])} card{'s' if len(plan['excluded']) != 1 else ''} not planned "
+                                      '(unknown, unsized or looping dependencies): see `estimate plan`.')
+    if plan['maybe_done']: notes.append(f"{len(plan['maybe_done'])} of these may already be done (Tiden links merged code).")
+
+    def one(a):
+        p = plan['agents'][a]; sched = p['schedule']
+        span = max([s['merged'] for s in sched] + ([p['end']['p80']] if dated else [])) or 1.0
+        tracks = [[] for _ in range(a)]
+        for s in sched:
+            c = cards[s['id']]
+            cls = ('cc ' if c['chain'] else '') + ('wt' if c['depends'] else '')
+            wait = f" · waits for #{s['waits_for']}" if c['depends'] and s['waits_for'] else ''
+            tracks[s['agent'] - 1].append(
+                f'<div class="card {cls}" style="--l:{s["start"] / span:.4f};--w:{max(s["worked"] - s["start"], 0) / span:.4f}" '
+                f'title="{e(c["title"])} · {c["sp"]} SP{" · critical chain" if c["chain"] else ""}{e(wait)}">{e(c["label"])}</div>')
+            if s['merged'] - s['worked'] > 1e-9:
+                tracks[s['agent'] - 1].append(f'<div class="card mw" aria-hidden="true" style="--l:{s["worked"] / span:.4f};'
+                                              f'--w:{(s["merged"] - s["worked"]) / span:.4f}"></div>')
+        lanes = ''.join(f'<div class="lane"><span class="who">agent {k}</span><div class="track">{"".join(t)}</div></div>'
+                        for k, t in enumerate(tracks, 1))
+        if dated:
+            x, b = p['end']['p50'] / span, p['end']['p80'] / span
+            lanes += (f'<div class="lane"><span class="who">buffer</span><div class="track buf" role="img" aria-label="project buffer '
+                      f'{_num(p["buffer"] / 24)} days, p50 to p80"><i style="--l:{x:.4f};--w:{max(b - x, 0):.4f}"></i></div></div>'
+                      f'<div class="mark{" end" if x > .8 else ""}" style="--x:{x:.3f}"><b>p50 · {_date(now, p["end"]["p50"], tz)}</b></div>')
+            line = e(agents_line(plan, a, now, tz)) + '.'
+            right = f"p80 · {_date(now, p['end']['p80'], tz)}"
+        else:
+            line = f'{_agents(a)}: {plan["sp"]} SP in this order.'; right = f'{_num(span)} SP of work'
+        waiting = [(cards[s['id']], s['waits_for']) for s in sorted(sched, key=lambda s: s['start']) if cards[s['id']]['depends'] and s['waits_for']]
+        waits = ('<p class="waits">Dimmed cards wait for another card: '
+                 + ' · '.join(f"<b>{e(_title(c)[0] or c['label'])}</b> waits for #{e(w)}" for c, w in waiting[:6])
+                 + (f' · +{len(waiting) - 6} more' if len(waiting) > 6 else '') + '</p>') if waiting else ''
+        return (f'<div class="v ah{a}"><p class="line">{line}</p>'
+                f'<div class="axis"><span>now · {_date(now, 0, tz)}</span><span>{e(right)}</span></div>'
+                f'<div class="lanes">{lanes}</div>{waits}</div>')
+    chain = plan['chain']
+    legend = ('<p class="legend"><span><i style="background:var(--violet)"></i>critical chain</span>'
+              '<span><i style="background:var(--likely)"></i>card</span><span><i style="background:var(--likely);opacity:.55"></i>waits for another card</span>'
+              '<span><i style="height:5px;background:repeating-linear-gradient(135deg,var(--muted) 0 2px,transparent 2px 5px)"></i>merge wait</span>'
+              + ('<span><i style="border:1px solid var(--coral)"></i>buffer to p80</span>' if dated else '')
+              + (f"<span>Chain: {e(' → '.join('#' + x for x in chain['labels']))} ({chain['sp']} SP). " if chain['labels'] else '<span>')
+              + f"Lanes show the simulated run that ends nearest the p50; "
+              'dates are p50/p80 of all runs.</span></p>')
+    return (f'<section class="ahead" aria-label="Ahead"><div class="head"><h2>Ahead · next {len(cards)} card{"s" if len(cards) != 1 else ""}</h2>{switch}</div>'
+            + ''.join(one(a) for a in PARALLEL) + legend
+            + ''.join(f'<p class="fine">{e(n)}</p>' for n in notes) + '</section>')
+
+
+USAGE_PERIODS = (30, 90)   # the dashboard's Usage switch; 30 is checked
+USAGE_CSS = """
+.usage{margin-top:40px;border-top:1px solid var(--line);padding-top:14px}
+.usage .head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.usage .head h2{margin:0}
+.u{display:none}.usage .line{margin-top:10px;max-width:none}.usage .line small{color:var(--muted);font-size:13px;margin-left:6px}
+.tiles{margin-top:22px;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:20px}
+.tiles .w .big{font-size:40px}
+.charts{margin-top:32px;display:grid;grid-template-columns:1fr 1fr;gap:24px 48px}
+.charts figure{margin:0}.charts svg{display:block;width:100%;height:120px;border-bottom:1px solid var(--line)}
+.charts .axis{margin-top:6px}
+.chart .s0{fill:var(--violet)}.chart .s1{fill:var(--coral)}.chart .s2{fill:var(--lime)}.chart .s3{fill:var(--warn)}.chart .s4{fill:var(--muted)}
+.chart g:hover rect{opacity:.75}
+.legend i.s0{background:var(--violet)}.legend i.s1{background:var(--coral)}.legend i.s2{background:var(--lime)}.legend i.s3{background:var(--warn)}.legend i.s4{background:var(--muted)}
+.urow{display:grid;grid-template-columns:minmax(0,1fr) 64px 56px;gap:4px 12px;align-items:baseline;padding:8px 0;border-bottom:1px solid var(--line)}
+.urow .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.urow .s{text-align:right;font-weight:600}
+.urow .p{text-align:right;color:var(--muted)}
+.urow .sub{grid-column:1/-1;color:var(--faint);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.urow .bar{grid-column:1/-1;height:4px;margin-top:2px}.urow .bar i{background:var(--violet)}
+.urow .flag{margin-left:.5em;font-size:11.5px;color:var(--warn);border:1px solid currentColor;border-radius:999px;padding:0 .45em;white-space:nowrap}
+.controls .row>span.hint{width:auto;color:var(--faint)}
+@media (max-width:720px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.tiles .w .big{font-size:32px}.charts{grid-template-columns:1fr}}
+"""
+
+
+def usage_css(periods):
+    out = [f'#us-{d}:checked~main .u.d{d}{{display:revert}}#us-{d}:checked~main label[for=us-{d}]{{--on:1;color:var(--ink)}}'
+           f'#us-{d}:focus-visible~main label[for=us-{d}]{{outline:2px solid var(--focus);outline-offset:2px}}' for d in periods]
+    return USAGE_CSS + '\n'.join(out)
+
+
+def usage_series(rep, by):
+    """(series names, label of each) for the daily chart: both agents, or the top four models by $ and 'other'."""
+    if by == 'agents': return ['claude-code', 'codex'], ['Claude Code', 'Codex']
+    priced = [m['model'] for m in rep['models'] if m['usd']]
+    top = priced[:4]
+    return top + (['other'] if len(priced) > 4 else []), [_short_model(m) for m in top] + (['other'] if len(priced) > 4 else [])
+
+
+def usage_svg(rep, by):
+    """A static stacked bar chart of daily $ (no script): one bar per day, a <title> tooltip per bar."""
+    e = html.escape; names, labels = usage_series(rep, by); days = rep['daily']
+    top = set(names) - {'other'}
+    stacks = []
+    for d in days:
+        vals = d[by]
+        stack = [vals.get(n, 0.0) for n in names if n != 'other'] + ([sum(v for k, v in vals.items() if k not in top)] if 'other' in names else [])
+        stacks.append(stack)
+    peak = max((sum(s) for s in stacks), default=0)
+    bw = 10; out = []
+    for i, (d, stack) in enumerate(zip(days, stacks)):
+        y = 100.0; rects = []
+        for k, v in enumerate(stack):
+            h = v / peak * 96 if peak else 0
+            if h > 0: y -= h; rects.append(f'<rect class="s{k}" x="{i * bw + 1.5}" y="{y:.2f}" width="{bw - 3}" height="{h:.2f}"/>')
+        tip = f"{_day(d['date'])} · {_usd(sum(stack))}" + ''.join(f' · {l} {_usd(v)}' for l, v in zip(labels, stack) if v)
+        out.append(f'<g><title>{e(tip)}</title><rect x="{i * bw}" y="0" width="{bw}" height="100" fill="transparent"/>{"".join(rects)}</g>')
+    busiest = max(range(len(days)), key=lambda i: sum(stacks[i])) if days else None
+    aria = (f"Daily $ by {'agent' if by == 'agents' else 'model'}, last {rep['days']} days"
+            + (f"; the most was {_usd(peak)} on {_day(days[busiest]['date'])}" if peak else '; no priced spend'))
+    legend = ''.join(f'<span><i class="s{k}"></i>{e(l)}</span>' for k, l in enumerate(labels))
+    return (f'<figure><h2>Daily $ by {"agent" if by == "agents" else "model"}</h2>'
+            f'<svg class="chart" viewBox="0 0 {len(days) * bw} 100" preserveAspectRatio="none" role="img" aria-label="{e(aria)}">{"".join(out)}</svg>'
+            f'<div class="axis"><span>{e(_day(days[0]["date"]))}</span><span>max {e(_usd(peak))}/day</span><span>{e(_day(days[-1]["date"]))}</span></div>'
+            f'<p class="legend">{legend}</p></figure>')
+
+
+def share_pct(m):
+    return f"{m['share'] * 100:.0f}%"
+
+
+def usage_block(rep, tz=None):
+    """One period of the Usage section: the spend line, cache tiles, daily charts, repos, top sessions, models, parallelism."""
+    e = html.escape; t, c, p = rep['total'], rep['cache'], rep['parallel']
+    if not t['responses']:
+        return f'<p class="empty">No agent responses in the last {rep["days"]} days.</p>'
+    approx = f'<small>approximate: {e(_tok(t["unpriced_tokens"]))} tokens have no price</small>' if t['approximate'] else ''
+    line = (f'<p class="line"><b>{e(_usd(t["usd"]))}</b> API-equivalent over {rep["days"]} days · <b>{e(_tok(t["tokens"]))}</b> tokens · '
+            f'{t["sessions"]} session{"s" if t["sessions"] != 1 else ""}{approx}</p>')
+    share = f"{c['cached_share'] * 100:.0f}" if c['cached_share'] is not None else '–'
+    tiles = [('Processed', _tok(c['processed']), 'tokens', 'input, cache and output'),
+             ('Cached input', share, '%', f"{_tok(c['cache_read'])} read from cache"),
+             ('Uncached input', _tok(c['uncached_input']), 'tokens', f"incl. {_tok(c['cache_write'])} cache writes"),
+             ('Output', _tok(c['output']), 'tokens', ''),
+             ('Cache savings', _usd(c['savings_usd']), '', 'cached reads at the input price, minus their cost')]
+    tiles_html = '<div class="tiles">' + ''.join(
+        f'<div class="w"><div class="lab"><span>{e(a)}</span></div><div class="big disp">{e(v)}'
+        + (f'<small>{e(unit)}</small>' if unit else '') + '</div>' + (f'<div class="sub">{e(sub)}</div>' if sub else '') + '</div>'
+        for a, v, unit, sub in tiles) + '</div>'
+    charts = f'<div class="charts">{usage_svg(rep, "agents")}{usage_svg(rep, "models")}</div>'
+    rows = rep['repos']; shown = rows[:TOP_REPOS]; rest = rows[TOP_REPOS:]
+    most = max((r['usd'] for r in rows), default=0) or 1
+
+    def repo_row(name, usd, tokens, sessions, pps=None, prs=None):
+        sub = f"{_tok(tokens)} tokens · {sessions} session{'s' if sessions != 1 else ''}" + (
+            f' · {prs} PRs, {pps:.2f}/session' if pps is not None else '')
+        return (f'<div class="urow"><span class="t" title="{e(name)}">{e(name)}</span><span class="s">{e(_usd(usd))}</span>'
+                f'<span class="p">{usd / t["usd"] * 100 if t["usd"] else 0:.0f}%</span>'
+                f'<div class="bar" aria-hidden="true"><i style="width:{usd / most * 100:.1f}%"></i></div><span class="sub">{e(sub)}</span></div>')
+    repos = ''.join(repo_row(r['repo'], r['usd'], r['tokens'], r['sessions'], r['prs_per_session'], r['prs']) for r in shown)
+    if rest: repos += repo_row(f'{len(rest)} more', sum(r['usd'] for r in rest), sum(r['tokens'] for r in rest), sum(r['sessions'] for r in rest))
+    loc = lambda s: utc(s).astimezone(tz) if tz else utc(s).astimezone()
+    sessions = ''.join(
+        f'<div class="urow"><span class="t" title="{e(s["label"] or "")}">{e(s["label"] or s["repo"])}</span><span class="s">{e(_usd(s["usd"]))}</span>'
+        f'<span class="p">{e(_day(loc(s["start"]).date()))}</span><span class="sub">{e(AGENT_NAMES.get(s["agent"], s["agent"]))} · '
+        f'{e(_short_model(s["model"]))}' + (f' · {e(s["repo"])}' if s['label'] else '') + f' · {e(_tok(s["tokens"]))} tokens</span></div>'
+        for s in rep['sessions'])
+    models = ''.join(
+        f'<div class="urow"><span class="t">{e(_short_model(m["model"]))}'
+        + (f'<span class="flag">{"no price" if m["usd"] is None else "approximate"}</span>' if m['approximate'] else '')
+        + f'</span><span class="s">{e(_usd(m["usd"])) if m["usd"] is not None else "–"}</span>'
+        f'<span class="p">{share_pct(m) if m["usd"] is not None and m["share"] else "–"}</span>'
+        f'<span class="sub">{e(_tok(m["tokens"]))} tokens' + (f' · {e(_tok(m["unpriced_tokens"]))} without a price' if m['approximate'] and m['usd'] is not None else '')
+        + '</span></div>' for m in rep['models'])
+    kv = []
+    if p['slots']:
+        kv.append(('Sessions at once', f"<b>{e(_num(p['median']))}</b><small>median · p80 {e(_num(p['p80']))}</small>",
+                   f"<small class=\"ln\">over {p['slots']} active {SLOT_MIN}-minute slots · you usually run ~{p['usually']}</small>"))
+        busiest = max(p['days'], key=lambda d: (d['peak'], d['date']))
+        kv.append(('Busiest day', f"<b>{busiest['peak']}</b><small>at once</small>", f"<small class=\"ln\">{e(_day(busiest['date']))}</small>"))
+    if p['prs_per_session'] is not None:
+        kv.append(('Merged PRs per session', f"<b>{p['prs_per_session']:.2f}</b>",
+                   f"<small class=\"ln\">{p['prs']} PRs / {p['sessions']} sessions, repos with merge history</small>"))
+    par = ('<div><h2>Parallelism</h2><div class="kv">' + ''.join(f'<div>{e(k)}</div><div>{v}{n}</div>' for k, v, n in kv) + '</div></div>') if kv else '<div></div>'
+    return (line + tiles_html + charts
+            + f'<div class="grid"><div><h2>Spend by repo</h2>{repos}</div><div><h2>Top sessions by $</h2>{sessions}</div></div>'
+            + f'<div class="grid"><div><h2>Models</h2>{models}</div>{par}</div>')
+
+
+def usage_section(usage, tz=None):
+    """(radios, section html, css) for the dashboard; `usage`: {days: usage_report}, {'error': True} or None (no section)."""
+    if not usage: return '', '', ''
+    if usage.get('error'):
+        return '', ('<section class="usage" aria-label="Usage"><div class="head"><h2>Usage</h2></div>'
+                    '<p class="empty">Agent logs could not be read for usage.</p></section>'), USAGE_CSS
+    periods = [d for d in USAGE_PERIODS if d in usage]
+    radios = ''.join(f'<input type="radio" class="radio" name="us" id="us-{d}" aria-label="Usage: last {d} days"'
+                     f'{" checked" if d == periods[0] else ""}>' for d in periods)
+    seg = ('<div class="seg" role="group" aria-label="Usage period" aria-hidden="true">'
+           + ''.join(f'<label for="us-{d}">{d} days</label>' for d in periods) + '</div>')
+    body = ''.join(f'<div class="u d{d}">{usage_block(usage[d], tz)}</div>' for d in periods)
+    return radios, f'<section class="usage" aria-label="Usage"><div class="head"><h2>Usage</h2>{seg}</div>{body}</section>', usage_css(periods)
+
+
+def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=None, tz=None, windows=None, subs=(), plan=None,
+                   usage=None):
     """The Teammate dashboard: how many cards a time box × agents gets done (sure, likely, maybe waterlines) with
     its agent hours, $ and tokens, the agent lanes, plan windows, the backlog in Score order, and burn and rates.
     No script: the planner is 20 precomputed states switched by CSS, "show all" is a checkbox.
@@ -2410,6 +3516,8 @@ def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=
     `source`: {'label': 'Tiden · Shop', 'updated': datetime or None}. `unsized`: rows without effort, listed
     last and left out of every total. `burn`: `burn_report` output, {'error': ...}, or None. `tz`: local time zone.
     `windows`: `window_report` output or None. `subs`: `subscriptions` plans; their row is hidden without them.
+    `plan`: `plan_forecast` of the next AHEAD_CARDS cards for the Ahead section, or None.
+    `usage`: {days: `usage_report`} for the Usage section (and the planner's "you usually run ~N"), {'error': True}, or None.
     """
     e = html.escape
     loc = now.astimezone(tz) if tz else now.astimezone()
@@ -2449,7 +3557,7 @@ def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=
                         f"over {span} day{'s' if span != 1 else ''}" + (f'; it can easily take {round(ratio)}× longer.' if ratio >= 1.5 else '.'))
             for a in PARALLEL:
                 pd = parallel_days(days, a, total, cp['sp'], c)
-                pace_rows.append((f'All {total} SP, {_agents(a)}', f"<b>{_num(pd['mid'])} d</b>",
+                pace_rows.append((f'All {total} SP, {_agents(a)}, wall clock', f"<b>{_num(pd['mid'])} d</b>",
                                   f"<small>{_num(pd['lo'])}–{_num(pd['hi'])}{' · dependencies wait' if pd['limited'] else ''}</small>"))
         elif cp['cycle']:
             loop = ' → '.join('#' + lab.get(i, i) for i in cp['cycle'])
@@ -2475,6 +3583,10 @@ def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=
                 '<code>| id | title | effort | value | depends |</code> in <code>BACKLOG.md</code>, or connect Tiden with '
                 '<code>estimate setup</code>.</p></div></section>')
 
+    if not has and not backlog:
+        foot.append('No measured pace yet: `estimate init --last 30` sizes recent merged PRs blind and seeds it; '
+                    'otherwise it starts once estimated PRs merge (`estimate record`).')
+
     def variants(fn, tag='span'):
         return ''.join(f'<{tag} class="v {b[0]}a{a}">{fn(states[(b[0], a)], b, a)}</{tag}>' for b in boxes for a in PARALLEL)
 
@@ -2487,7 +3599,7 @@ def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=
         if not s['likely']['cards']:
             return f'Not even the first card ({ordered[0]["sp"]} SP) is likely done in {e(box)} with {_agents(a)}.'
         lead = f'<b>All {total} SP</b> fit' if s['all'] else f'<b>{s["likely"]["sp"]} SP</b> likely done'
-        parts = ([f'about <b>{e(_hrs(s["hours"]))}</b> of agent work'] if s['hours'] is not None else []) + \
+        parts = ([f'about <b>{e(_hrs(s["hours"]))}</b> of agent active time, summed'] if s['hours'] is not None else []) + \
                 ([f'<b>{e(_usd(s["usd"]))}</b>'] if s['usd'] is not None else []) + \
                 ([f'<b>{e(_tok(s["tok"]))}</b> tokens'] if s['tok'] is not None else [])
         return f'{lead} in {e(box)} with {_agents(a)}' + (': ' + ', '.join(parts) if parts else '') + '.'
@@ -2526,6 +3638,14 @@ def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=
         return f'<div class="mark lo{" end" if x > .8 else ""}" style="--x:{x:.3f}"><b>5-hour window resets {resets.astimezone(tz) if tz else resets.astimezone():%H:%M}</b></div>'
 
     radios = ''
+    try:  # the Usage section is optional: a drawing error shows its error card and leaves the rest of the page
+        usual = next((u['parallel']['usually'] for d in USAGE_PERIODS if isinstance(u := (usage or {}).get(d), dict)
+                      and u['parallel'].get('usually')), None)
+        u_radios, u_section, u_css = usage_section(usage, tz)
+    except Exception as err:  # noqa: BLE001
+        print(f'estimate: the Usage section was not drawn: {type(err).__name__}', file=sys.stderr)
+        usual = None; u_radios, u_section, u_css = usage_section({'error': True})
+    usually = f'<span class="hint">you usually run ~{usual}</span>' if usual else ''
     if states:
         radios = (''.join(f'<input type="radio" class="radio" name="tb" id="tb-{b[0]}" aria-label="Time box: {e(b[1])}, {e(b[2])}"'
                                                    f'{" checked" if b[0] == default[0] else ""}>' for b in boxes)
@@ -2537,13 +3657,22 @@ def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=
                 f'<h1 class="huge disp">{variants(cards_html)}</h1><p class="line">{variants(answer)}</p><p class="fine">{variants(fine)}</p></div>'
                 '<div class="controls">'
                 f'<div class="row"><span>Time box</span>{seg("Time box", [(f"tb-{b[0]}", f"{e(b[1])}<small>{e(b[2])}</small>") for b in boxes])}</div>'
-                f'<div class="row"><span>Agents</span>{seg("Agents", [(f"ag-{a}", str(a)) for a in PARALLEL])}</div></div></section>')
+                f'<div class="row"><span>Agents</span>{seg("Agents", [(f"ag-{a}", str(a)) for a in PARALLEL])}{usually}</div></div></section>')
         axis = variants(lambda s, b, a: f'<div class="axis"><span>now · {loc:%H:%M}</span><span>{e(b[1])} · {e(b[2])}</span></div>', 'div')
         timeline = (f'<section class="tl" aria-label="Agent lanes">{axis}'
                     + ''.join(f'<div class="v {b[0]}a{a}"><div class="lanes">{lanes(states[(b[0], a)], b, a)}</div></div>' for b in boxes for a in PARALLEL)
                     + '<p class="legend"><span><i style="background:var(--sure)"></i>sure</span><span><i style="background:var(--likely)">'
                     '</i>likely</span><span><i style="background:var(--maybe)"></i>maybe</span>'
                     '<span>Lanes are an ideal schedule in Score order, dependencies first; review and merge waits are not drawn.</span></p></section>')
+    ahead = ''
+    if plan and plan.get('agents'):
+        own = not states
+        if own:
+            radios += ''.join(f'<input type="radio" class="radio" name="ag" id="ag-{a}" aria-label="{_agents(a)}"{" checked" if a == default[1] else ""}>'
+                              for a in PARALLEL)
+        switch = ('<div class="seg" role="group" aria-label="Agents" aria-hidden="true">'
+                  + ''.join(f'<label for="ag-{a}">{a}</label>' for a in PARALLEL) + '</div>' + usually) if own else ''
+        ahead = ahead_html(plan, now, tz, switch)
     strip = ('<section class="strip" aria-label="Plan windows">'
              + ''.join(f'<div class="w"><div class="lab"><span>{e(label)}</span><span>{e(right)}</span></div>'
                        + (f'<div class="big disp">{pct:.0f}<small>% used</small></div>' if pct is not None else '')
@@ -2603,36 +3732,172 @@ def dashboard_html(repo, rows, cal, backlog, now, source=None, unsized=(), burn=
                     f"({price['hours']['h5']} for the 5-hour window, {price['hours']['w7']} for the week).")
     if unsized: foot.append(f"{len(unsized)} card{'s have' if len(unsized) != 1 else ' has'} no size yet and {'are' if len(unsized) != 1 else 'is'} not counted.")
     if backlog: foot.append('Score is value ÷ effort: higher goes first, dependencies before.')
+    if states: foot.append(f'Agent hours are {ACTIVE_LABEL}; the “All … SP” rows are wall clock for that many agents, '
+                           'never shorter than the longest dependency chain.')
+    if u_radios:
+        foot.append('Usage counts every local Claude Code and Codex log by repo (the git remote of each session’s folder, so '
+                    'worktrees pool); labels are the first line of a session’s first prompt, hidden with --no-labels.')
     foot_html = ('<footer class="foot">' + ''.join(f'<p class="warn">{e(w)}</p>' for w in warn)
                  + ''.join(f'<p>{e(f)}</p>' for f in foot) + '</footer>')
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0a0b12" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#f4f4fb" media="(prefers-color-scheme: light)">
-<title>Teammate · {e(repo)}</title><style>{CSS}{state_css(boxes) if states else ''}</style></head><body>{radios}<main>
+<title>Teammate · {e(repo)}</title><style>{CSS}{state_css(boxes) if states else ''}{ahead_css(not states) if ahead else ''}{u_css}</style></head><body>{radios}{u_radios}<main>
 {head}
 {hero}
 {timeline}
+{ahead}
 {strip}
 {grid}
+{u_section}
 {foot_html}
 </main></body></html>"""
 
 
-# ---------- commands ----------
+# ---------- commands: where the data live ----------
+
+REGISTRY = '~/.config/agent-estimate/projects.json'  # {"owner/repo": {"dir": ..., "claude_project_dir": ...}} ($ESTIMATE_REGISTRY)
+DATA_FILES = ('ledger.jsonl', 'history.json', 'config.json')  # a walked-up .estimate counts only with one of these
+
+
+def registry_path():
+    return Path(os.environ.get('ESTIMATE_REGISTRY') or REGISTRY).expanduser()
+
+
+def read_registry():
+    """The per-user project registry; missing or damaged reads as empty (a damaged file is named on stderr)."""
+    path = registry_path()
+    if not path.exists(): return {}
+    try: reg = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError): reg = None
+    if not isinstance(reg, dict):
+        print(f'estimate: ignoring {path}: not a JSON object', file=sys.stderr); return {}
+    out = {}
+    for repo, v in reg.items():
+        v = v if isinstance(v, dict) else {}
+        cp = v.get('claude_project_dir')
+        cp = [cp] if isinstance(cp, str) else cp if isinstance(cp, list) and all(isinstance(x, str) for x in cp) else None
+        entry = {**({'dir': v['dir']} if isinstance(v.get('dir'), str) and v['dir'] else {}), **({'claude_project_dir': cp} if cp else {})}
+        if set(entry) != {k for k in ('dir', 'claude_project_dir') if k in v}:
+            print(f'estimate: {path}: ignoring damaged fields of {repo!r} (dir: a path; claude_project_dir: a path or a list)', file=sys.stderr)
+        if entry: out[repo] = entry
+    return out
+
+
+def write_registry(repo, entry):
+    """Set one project's entry (dir, optional claude_project_dir); other projects are kept."""
+    reg = read_registry(); reg[repo] = entry; path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, json.dumps(reg, ensure_ascii=False, indent=1, sort_keys=True) + '\n')
+    return path
+
+
+def remote_repo(cwd=None, timeout=None):
+    """owner/name from the git remote (origin, else the first remote), so every worktree of a repo agrees; None outside git.
+    With `timeout`, a git call that takes longer raises subprocess.TimeoutExpired."""
+    def git(*a):
+        try: return subprocess.run(['git', *a], capture_output=True, text=True, check=True, cwd=cwd, timeout=timeout).stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError): return ''
+    names = git('remote').split()
+    if not names: return None
+    url = git('remote', 'get-url', 'origin' if 'origin' in names else names[0])
+    # GitHub only (the tool reads PRs through gh): https/ssh URL or scp-like, exactly owner/name; never a path or another host.
+    m = re.fullmatch(r'(?:(?:https?|ssh|git)://(?:[^@/]+@)?github\.com(?::\d+)?/|[^@/\s]+@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?/?', url)
+    return f'{m.group(1)}/{m.group(2)}' if m else None
+
+
+def walk_up_dir(start=None):
+    """The nearest `.estimate/` at or above `start` (cwd) holding a ledger, history or config, else None."""
+    here = Path(start or Path.cwd()).resolve()
+    for d in (here, *here.parents):
+        cand = d / '.estimate'
+        if cand.is_dir() and any((cand / f).exists() for f in DATA_FILES): return cand
+    return None
+
+
+def _quiet_config(d):
+    """config.json of a data dir, or None when missing or damaged (the command that needs it reports that)."""
+    try: return Store(d).read_json('config.json') if d else None
+    except (OSError, ValueError): return None
+
+
+def transcript_dir(path, claude_root):
+    """(dir to use, note or None) for a --claude-project-dir value. A dir under the Claude projects root is
+    kept; a checkout maps to its transcript dir there (Claude names it after the path, every character other
+    than a letter or digit as '-') when that exists; anything else is kept as given, with a warning."""
+    p = Path(path).expanduser().absolute(); root = Path(claude_root).expanduser().absolute()
+    if p.resolve().is_relative_to(root.resolve()): return str(p), None
+    for cand in dict.fromkeys((p, p.resolve())):
+        enc = root / re.sub(r'[^A-Za-z0-9]', '-', str(cand))
+        if enc.is_dir(): return str(enc), f'{p} is a checkout: using its transcript dir {enc}'
+    return str(p), (f'warning: {p} is not a transcript dir (none under {root}); omit it, '
+                  'matching by repo/branch is the default')
+
+
+def resolve(args):
+    """Data dir, repo and trusted Claude transcript dirs, each with where it came from.
+
+    Data dir: --dir, $ESTIMATE_DIR, the nearest `.estimate/` above cwd, the registry entry of the git remote,
+    else <git root>/.estimate. Repo: --repo, $ESTIMATE_REPO, the git remote, the data dir's config.json, `gh`.
+    Claude project dirs: --claude-project-dir, $ESTIMATE_CLAUDE_PROJECT_DIR, the registry entry.
+    """
+    if getattr(args, '_resolved', None): return args._resolved
+    remote = remote_repo(); entry = read_registry().get(args.repo or os.environ.get('ESTIMATE_REPO') or remote or '') or {}
+    reg = f'registry {registry_path()}'
+    if args.dir: d, d_from = args.dir, '--dir'
+    elif os.environ.get('ESTIMATE_DIR'): d, d_from = os.environ['ESTIMATE_DIR'], '$ESTIMATE_DIR'
+    elif found := walk_up_dir(): d, d_from = str(found), 'nearest .estimate/ above the current directory'
+    elif entry.get('dir'): d, d_from = os.path.expanduser(entry['dir']), reg
+    elif top := git_root(): d, d_from = os.path.join(top, '.estimate'), 'default <git root>/.estimate'
+    else: d, d_from = None, None
+    if args.repo: repo, r_from = args.repo, '--repo'
+    elif os.environ.get('ESTIMATE_REPO'): repo, r_from = os.environ['ESTIMATE_REPO'], '$ESTIMATE_REPO'
+    elif remote: repo, r_from = remote, 'git remote'
+    elif isinstance(cfg := _quiet_config(d), dict) and cfg.get('repo'): repo, r_from = cfg['repo'], 'config.json'
+    else: repo, r_from = None, 'gh'
+    cpd, c_from = args.claude_project_dir, '--claude-project-dir'
+    if not cpd and os.environ.get('ESTIMATE_CLAUDE_PROJECT_DIR'):
+        cpd, c_from = [p for p in os.environ['ESTIMATE_CLAUDE_PROJECT_DIR'].split(os.pathsep) if p], '$ESTIMATE_CLAUDE_PROJECT_DIR'
+    if not cpd and entry.get('claude_project_dir'): cpd, c_from = list(entry['claude_project_dir']), reg
+    if not cpd: c_from = None
+    mapped = [transcript_dir(p, args.claude_dir) for p in cpd or []]
+    args.claude_project_dir = list(dict.fromkeys(t for t, _ in mapped))
+    args._resolved = {'dir': d, 'dir_from': d_from, 'repo': repo, 'repo_from': r_from,
+                      'claude_project_dir': args.claude_project_dir, 'claude_project_dir_from': c_from,
+                      'claude_project_dir_notes': [n for _, n in mapped if n]}
+    return args._resolved
+
 
 def data_store(args):
-    d = args.dir or os.environ.get('ESTIMATE_DIR')
-    if not d:
-        top = git_root()
-        if not top: sys.exit('estimate: not in a git repo; pass --dir')
-        d = os.path.join(top, '.estimate')
+    d = resolve(args)['dir']
+    if not d: sys.exit('estimate: not in a git repo; pass --dir, set $ESTIMATE_DIR, or run `estimate link --dir D --repo owner/name`')
     return Store(d)
 
 
 def ctx(args):
-    repo = args.repo or os.environ.get('ESTIMATE_REPO') or detect_repo()
+    r = resolve(args)
+    repo = r['repo'] or detect_repo()
     now = utc(args.now) if args.now else datetime.now(timezone.utc)
     return repo, data_store(args), now
+
+
+def is_empty(store):
+    """No ledger, no merge history and no config.json: a wrong data dir, or one `estimate setup` never ran in.
+    A dir with only config.json is a fresh, set-up project: its dashboard shows how to seed a pace."""
+    return not any((store.dir / f).exists() for f in DATA_FILES)
+
+
+def require_data(store, args):
+    """Exit with one message when the data dir is empty, instead of printing n=0 numbers."""
+    if not is_empty(store): return
+    r = resolve(args)
+    sys.exit(f"estimate: empty data dir {store.dir} (from {r['dir_from']}): no ledger.jsonl, history.json or config.json.\n"
+             '  Point estimate at your data in one of 3 ways:\n'
+             '    --dir DIR                      on this command\n'
+             '    export ESTIMATE_DIR=DIR        for this shell\n'
+             '    estimate link --dir DIR        once per repo; works in every worktree and agent\n'
+             '  New repo? `estimate setup` first. '
+             'Check with `estimate doctor`.')
 
 
 def measure(prs, store, repo, args, since):
@@ -2816,11 +4081,19 @@ def record_report(prs, rows, pending, history, unsettled, ruled_out_sp):
     return lines
 
 
+def print_marks(marks, rows, days):
+    if not marks: return
+    refs = {r['id']: r['task_ref'] for r in rows}
+    print(f"  marked {len(marks)} estimate{'s' if len(marks) != 1 else ''} 'no PR' (no PR for the branch after {days:g} days; "
+          f"kept in the ledger, listed by `estimate doctor`): {', '.join(refs[m['id']] for m in marks[:8])}"
+          + (f' +{len(marks) - 8} more' if len(marks) > 8 else ''))
+
+
 def cmd_record(args):
     """Settle pending estimates from merged PRs, and ingest merged PRs that state `SP: n` in their body."""
     repo, store, now = ctx(args)
     rows = store.rows()
-    pending = [r for r in rows if not r.get('actual') and not r.get('superseded')]
+    pending = pending_rows(rows)
     known = {(estimator_key(r), r['actual']['pr']) for r in settled(rows)}
     sized = {pr for _, pr in known}
     prs = fetch_prs(repo, 'merged', args.history)
@@ -2830,9 +4103,12 @@ def cmd_record(args):
     for n in sorted(tracked - by_num.keys()):
         p = fetch_pr(repo, n)
         if p.get('mergedAt'): by_num[n] = p
-    prs = list(by_num.values()); save_history(store, prs)
+    prs = list(by_num.values())
+    seen = {p['number'] for p in store.read_json('history.json', []) or []}
+    new_prs = sum(1 for p in prs if p['number'] not in seen)
+    save_history(store, prs)
     match = defaultdict(list)
-    for r in pending:
+    for r in unsettled(rows):
         p = match_pr(r, prs)
         if p and (estimator_key(r), p['number']) not in known: match[p['number']].append(r)
     body_sp = {}; off_scale = []
@@ -2842,10 +4118,20 @@ def cmd_record(args):
         if m and int(m.group(1)) in FIB: body_sp[p['number']] = int(m.group(1))
         elif m: off_scale.append(p['number'])
     todo = [by_num[n] for n in sorted(set(match) | set(body_sp) | (refresh & by_num.keys()))]
-    unsettled = unsettled_reasons(pending, prs, known)
+    waiting = unsettled_reasons(pending, prs, known)
+    marks = no_pr_marks([r for r, _ in waiting], prs, now, args.no_pr_days)
+    try: has_pr = {b for b in {m['ref'] for m in marks} if branch_has_pr(repo, b)}
+    except SystemExit as err:  # marking is optional: a failed lookup must never stop settlement
+        print(f'estimate: no estimates marked \'no PR\' this run: {str(err.code).splitlines()[0]}', file=sys.stderr)
+        has_pr = {m['ref'] for m in marks}
+    marks = [{k: v for k, v in m.items() if k != 'ref'} for m in marks if m['ref'] not in has_pr]
     if not todo:
-        recalibrate(store, now, args.window)
-        print('\n'.join(record_report(prs, rows, pending, args.history, unsettled, sorted(off_scale)))); return
+        store.append(marks)
+        cal = recalibrate(store, now, args.window)
+        print('\n'.join(record_report(prs, rows, pending, args.history, waiting, sorted(off_scale))))
+        print_marks(marks, rows, args.no_pr_days)
+        for line in audit_lines(cal.get('audit'), store.dir / 'prices.json'): print(f'  {line}')
+        return {'settled': 0, 'new_prs': new_prs, 'no_pr': len(marks), 'n': cal['n'], 'prework': cal['prework']}
     acts = measure(todo, store, repo, args, None)
     events = []
     for n, rs in match.items():
@@ -2866,11 +4152,14 @@ def cmd_record(args):
             events.append({**acts[n], 'kind': 'actual', 'id': r['id'], 'recorded_at': iso(now),
                            'provenance': r['actual'].get('provenance', 'auto'), 'refresh': True})
             refreshed += 1
-    store.append(events)
+    store.append(events + marks)
     cal = recalibrate(store, now, args.window)
     print(f'estimate: settled estimates on {len(match)} PRs, ingested {len(body_sp)} PRs with an SP line, '
           f'refreshed {refreshed} actuals; calibration n={cal["n"]}')
-    for r, why in unsettled: print(f"  still pending {r['id']} ({r['task_ref']}, {r['sp']} SP): {why}")
+    for r, why in waiting: print(f"  still pending {r['id']} ({r['task_ref']}, {r['sp']} SP): {why}")
+    print_marks(marks, rows, args.no_pr_days)
+    for line in audit_lines(cal.get('audit'), store.dir / 'prices.json'): print(f'  {line}')
+    return {'settled': len(match) + len(body_sp), 'new_prs': new_prs, 'no_pr': len(marks), 'n': cal['n'], 'prework': cal['prework']}
 
 
 def cmd_calibrate(args):
@@ -2920,6 +4209,7 @@ def order_marks(item, label):
 
 def cmd_forecast(args):
     repo, store, now = ctx(args)
+    if args.backlog or not args.task: require_data(store, args)   # logging with --task starts a fresh ledger
     cal = recalibrate(store, now, args.window)
     if args.backlog:
         path = backlog_path(store, args.backlog)
@@ -2941,19 +4231,22 @@ def cmd_forecast(args):
                               'order': ordered, 'unsized': unsized, 'warnings': warnings}, indent=1)); return
         print(f"backlog: {sim['items']} items, {sim['sp']} SP (calibration n={cal['n']}, window {cal['window']['days']:g} d)")
         if unsized: print(f'  warning: {warnings[0]}')
-        for m, label, formatter in (('active_h', 'observed active ≈', fmt_h), ('usd', 'API-equivalent cost', fmt_usd)):
+        for m, label, formatter in (('active_h', f'{ACTIVE_LABEL}:', fmt_h), ('usd', 'API-equivalent cost', fmt_usd)):
             if sim.get(m):
                 v = sim[m]
                 print(f"  {label} {formatter(v['lo'], v['hi'])} (median {v['mid']:.2f}; n={v['n']}, {v['confidence']}, {v['kind']}; {v['basis']})")
         if sim.get('days'):
             d = sim['days']
+            conc = observed_concurrency(store.rows(), cal)
             print(f"  calendar     {_num(d['lo'])}–{_num(d['hi'])} d (median {_num(d['mid'])} d; "
-                  f"{d['n']} days, {d['prs']} PRs; {d['confidence']}, {d['kind']})")
+                  f"{d['n']} days, {d['prs']} PRs; {d['confidence']}, {d['kind']}"
+                  + (f"; this repo's pace with ≈{conc['value']:.1f} PRs in flight" if conc and conc['value'] > 1.05 else '') + ')')
+            for line in wall_clock_lines(items, d, conc): print(f'  {line}')
             if short := short_history(d): print(f'  warning: {short}')
         basis, wait = calendar_basis(sim)
         if basis: print(f'  based on: {basis}')
         if wait: print(f'  warning: {wait[0].lower() + wait[1:]}')
-        for line in audit_lines(cal.get('audit'), store.dir / 'prices.json'): print(f'  {line}')
+        if line := audit_summary(cal.get('audit')): print(f'  {line}')
         for i in sim['oversize']: print(f"  split first: {i['sp']} SP {i['title']}")
         print('order (Score = Value / Effort, dependencies first):')
         label = {i['id']: i['label'] for i in reversed(ordered)}
@@ -2977,9 +4270,25 @@ def cmd_forecast(args):
         store.append([new_estimate(args.sp, args.task, 'agent', now, agent, model, closest, q, cal['id'])])
     print(json.dumps({'line': line, 'estimator': key, **q, 'audit': cal.get('audit')}, indent=1) if args.json else line)
     # The quote stays one line on stdout; why its n is what it is goes to stderr.
-    if not args.json:
-        notes = audit_lines(cal.get('audit'), store.dir / 'prices.json')
-        if len(notes) > 1: print('\n'.join(notes), file=sys.stderr)
+    if not args.json and (note := audit_summary(cal.get('audit'))): print(note, file=sys.stderr)
+
+
+def cmd_plan(args):
+    repo, store, now = ctx(args)
+    require_data(store, args)
+    if args.agents < 1: sys.exit('estimate: --agents must be at least 1')
+    if args.top is not None and args.top < 1: sys.exit('estimate: --top must be at least 1')
+    cal = recalibrate(store, now, args.window)
+    path = backlog_path(store, args.backlog)
+    text = path.read_text(encoding='utf-8'); unsized = []
+    try: items = parse_backlog(text, unsized)
+    except ValueError as err: sys.exit(f'estimate: {path}: {err}')
+    caps, problems = lane_caps(text, _quiet_config(store.dir))
+    for msg in problems: print(f'estimate: {msg}', file=sys.stderr)
+    plan = plan_forecast(items, unsized, store.rows(), cal, commit_times(store), caps, args.agents, args.top, seed=args.seed)
+    if args.json:
+        print(json.dumps({**plan, 'now': iso(now), 'audit': cal.get('audit')}, indent=1)); return
+    for line in plan_lines(plan, now): print(line)
 
 
 def backlog_path(store, arg):
@@ -3021,8 +4330,9 @@ def cmd_backlog_pull(args):
     try: specs = run_tiden(cfg['product_id'], cwd=top)
     except RuntimeError as err: sys.exit(f'estimate: {err}')
     path = cfg['path']; existing = path.read_text(encoding='utf-8') if path.exists() else ''
+    product = tiden_product(cfg['product_id'], specs, cwd=top)
     text, notes = pull_tiden(specs, existing, cfg['product_id'], utc(args.now) if args.now else datetime.now(timezone.utc),
-                             cfg['statuses'], tiden_product_name(cfg['product_id'], specs, cwd=top))
+                             cfg['statuses'], product['name'], product['code'])
     store.ensure(); write_atomic(path, text)
     cards = sum(bool(re.fullmatch(_UUID, i.lower())) for i in _local_fields(text))  # hand-written rows are not cards
     print(f'estimate: wrote {path}: {cards} open card(s) of {len(specs)} specs')
@@ -3073,6 +4383,7 @@ def dashboard_source(store, bpath, text, repo):
 
 def cmd_dashboard(args):
     repo, store, now = ctx(args)
+    require_data(store, args)
     cal = recalibrate(store, now, args.window)
     try: bpath = Path(args.backlog) if args.backlog else dashboard_backlog_path(store)
     except ValueError as err: sys.exit(f'estimate: {err}')
@@ -3081,22 +4392,156 @@ def cmd_dashboard(args):
     try: backlog = parse_backlog(text, unsized) if text is not None else None
     except ValueError as err: sys.exit(f'estimate: {bpath}: {err}')
     out = Path(args.out) if args.out else store.dir / 'dashboard.html'
-    burn = windows = None; recs, limits = [], []
+    burn = windows = usage = None; recs, limits = [], []
     if not args.no_burn:
         # Unreadable or odd agent logs must never stop the dashboard: the burn rows say so instead.
+        # One scan of the longest Usage period feeds the burn rows, the window prices and the Usage section.
+        labels = labels_on(args, _quiet_config(store.dir)); meta = {}
         try:
-            recs = scan_burn(args.claude_dir, args.codex_dir, now - timedelta(days=BURN_DAYS), store.prices(), limits)
+            recs = scan_burn(args.claude_dir, args.codex_dir, now - timedelta(days=max(USAGE_PERIODS)), store.prices(), limits, meta, labels)
             burn = burn_report(recs, now, idle_min=args.idle_min)
         except Exception as err:  # noqa: BLE001
             print(f'estimate: agent logs not read for the burn rows: {type(err).__name__}', file=sys.stderr); burn = {'error': True}; recs = []
+        if not burn.get('error'):
+            try:  # the Usage section is optional: a failure there leaves the rest of the page as it was
+                reg = read_registry(); repos = session_repos(meta, reg); merged = merged_by_repo(reg, [(repo, str(store.dir))])
+                usage = {d: usage_report(recs, meta, repos, now, d, store.prices(), idle_min=args.idle_min, labels=labels, merged=merged)
+                         for d in USAGE_PERIODS}
+            except Exception as err:  # noqa: BLE001
+                print(f'estimate: the Usage section was not built: {type(err).__name__}', file=sys.stderr); usage = {'error': True}
     try: windows = window_report(read_snapshots(now), recs, limits[0] if limits else None, now)
     except Exception as err:  # noqa: BLE001 - window snapshots are optional; the cards then say "no snapshot yet"
         print(f'estimate: plan-window snapshots not read: {type(err).__name__}', file=sys.stderr)
     subs, problem = subscriptions(store.read_json('config.json'))
     if problem: print(f'estimate: {problem}', file=sys.stderr)
+    plan = None
+    if backlog:
+        try:  # the Ahead section is optional: a planning error must never stop the dashboard
+            caps, problems = lane_caps(text, _quiet_config(store.dir))
+            for msg in problems: print(f'estimate: {msg}', file=sys.stderr)
+            plan = plan_forecast(backlog, unsized, store.rows(), cal, commit_times(store), caps, top=AHEAD_CARDS)
+        except Exception as err:  # noqa: BLE001
+            print(f'estimate: the Ahead plan was not built: {type(err).__name__}', file=sys.stderr)
     store.ensure(); out.write_text(dashboard_html(repo, store.rows(), cal, backlog, now, dashboard_source(store, bpath, text, repo), unsized,
-                                                  burn, windows=windows, subs=subs), encoding='utf-8')
+                                                  burn, windows=windows, subs=subs, plan=plan, usage=usage), encoding='utf-8')
     print(f'estimate: wrote {out}')
+    return {'out': str(out), 'n': cal['n'], 'prework': cal['prework']}
+
+
+def all_line(cmd, res):
+    if cmd == 'record':
+        return (f"settled {res['settled']}, new PRs {res['new_prs']}, calibration n={res['n']}, pre-work n={res['prework']}"
+                + (f", marked no PR {res['no_pr']}" if res['no_pr'] else ''))
+    return f"wrote {res['out']}, calibration n={res['n']}, pre-work n={res['prework']}"
+
+
+def run_all(args):
+    """`record --all` / `dashboard --all`: every project in the registry, one line each. A project's failure is
+    reported and the loop goes on; the exit status is non-zero only when every project failed."""
+    if args.dir or args.repo or getattr(args, 'out', None) or getattr(args, 'backlog', None):
+        sys.exit('estimate: --all reads every project from the registry; drop --dir, --repo, --out and --backlog')
+    reg = {repo: e for repo, e in read_registry().items() if e.get('dir')}
+    if not reg: sys.exit(f'estimate: no projects with a data dir in {registry_path()} (`estimate link --dir D` in each repo)')
+    failed = 0
+    # Each project's transcript dirs come from its own registry entry, never from this shell's environment.
+    os.environ.pop('ESTIMATE_CLAUDE_PROJECT_DIR', None)
+    # One clock and one log scan for the whole run: every project reads the same transcripts (`scan_burn` cache).
+    now = args.now or iso(datetime.now(timezone.utc))
+    global _SCAN_CACHE
+    def shows_labels(entry):
+        try: return labels_on(args, _quiet_config(os.path.expanduser(entry['dir'])))
+        except Exception: return True  # noqa: BLE001 - an unreadable config is reported by that project's own run
+    _SCAN_CACHE = {'labels': any(shows_labels(e) for e in reg.values())}
+    try:
+        for repo, entry in sorted(reg.items()):
+            one = argparse.Namespace(**{**vars(args), 'all': False, 'repo': repo, 'dir': os.path.expanduser(entry['dir']),
+                                        'claude_project_dir': None, '_resolved': None, 'now': now})
+            try:
+                with contextlib.redirect_stdout(io.StringIO()): res = args.f(one)
+                print(f'{repo}: {all_line(args.cmd, res)}')
+            except (Exception, SystemExit) as err:  # noqa: BLE001 - one project's failure must not stop the others
+                failed += 1
+                msg = err.code if isinstance(err, SystemExit) else f'{type(err).__name__}: {err}'
+                print(f"{repo}: FAILED {str(msg).splitlines()[0] if msg else 'exit'}")
+    finally:
+        _SCAN_CACHE = None
+    if failed == len(reg): sys.exit(1)
+
+
+def gh_auth_ok():
+    """(ok, detail) from `gh auth status`; read-only."""
+    try: r = subprocess.run(['gh', 'auth', 'status'], capture_output=True, text=True, check=False, timeout=20)
+    except FileNotFoundError: return False, 'gh not found (https://cli.github.com)'
+    except subprocess.TimeoutExpired: return False, 'gh auth status timed out'
+    return (True, 'ok') if r.returncode == 0 else (False, 'not logged in: run `gh auth login`')
+
+
+def statusline_installed():
+    try: cfg = json.loads(_settings_file().read_text(encoding='utf-8'))
+    except (OSError, ValueError): return False
+    line = cfg.get('statusLine') if isinstance(cfg, dict) else None
+    return isinstance(line, dict) and _ours(line.get('command'))
+
+
+def cmd_doctor(args):
+    """Which data dir, repo and Claude transcript dirs this command line resolves to, and from where; what is in
+    the data dir; gh auth; the status-line hook; the full sample audit. Reads only: writes nothing."""
+    r = resolve(args)
+    repo = r['repo']; r_from = r['repo_from']
+    if not repo:
+        try: repo = detect_repo()
+        except SystemExit: repo, r_from = None, 'not found (pass --repo or set $ESTIMATE_REPO)'
+    d = r['dir']
+    print(f"data dir     {d or 'none'}  (from {r['dir_from'] or 'nothing: not in a git repo'})")
+    print(f"repo         {repo or 'none'}  (from {r_from})")
+    cpd = r['claude_project_dir']
+    print(f"claude dirs  {os.pathsep.join(cpd) if cpd else 'none extra'}  (from {r['claude_project_dir_from'] or 'default: scan ' + args.claude_dir + ' by repo name'})")
+    for note in r['claude_project_dir_notes']: print(f'  {note}')
+    reg = read_registry()
+    print(f"registry     {registry_path()}: " + (f"{len(reg)} project{'s' if len(reg) != 1 else ''}"
+          + (f", {repo} linked" if repo in reg else f", {repo or 'this repo'} not linked") if reg else 'none (`estimate link --dir D`)'))
+    cal = None
+    if d:
+        store = Store(d)
+        if is_empty(store):
+            print(f'ledger       empty: no ledger.jsonl, history.json or config.json in {d}')
+        else:
+            rows = store.rows(); done = settled(rows)
+            pending = pending_rows(rows); no_pr = [x for x in unsettled(rows) if x.get('no_pr')]
+            print(f"ledger       {len(rows)} estimates ({len(done)} settled, {len(pending)} pending"
+                  + (f', {len(no_pr)} no PR' if no_pr else '') + f"); history {len(store.read_json('history.json', []) or [])} merged PRs")
+            if no_pr:
+                print(f"no PR        {', '.join(str(x['task_ref']) for x in no_pr)} (`record` found no PR for the branch after "
+                      f"--no-pr-days, default {NO_PR_DAYS}; a PR merged later still settles them)")
+            now = utc(args.now) if args.now else datetime.now(timezone.utc)
+            since = opt_utc((store.read_json('config.json') or {}).get('since'))
+            cal = calibrate(rows, now, args.window, since, merged_times(store))
+            print(f"calibration  n={cal['n']}, window {cal['window']['days']:g} d")
+    ok, detail = gh_auth_ok()
+    print(f'gh auth      {detail}')
+    print(f"status line  {'installed: logs plan windows' if statusline_installed() else 'not installed (`estimate install --statusline`, optional)'}")
+    if cal:
+        for line in audit_lines(cal.get('audit'), Path(d) / 'prices.json'): print(f'  {line}')
+
+
+def cmd_link(args):
+    """Register a data dir for a repo in the per-user registry, so every worktree and agent of it finds the data."""
+    repo = args.repo or os.environ.get('ESTIMATE_REPO') or remote_repo()
+    if not repo: sys.exit('estimate: no git remote here; pass --repo owner/name')
+    if not args.dir: sys.exit('estimate: pass --dir DIR (the data directory to use for this repo)')
+    d = Path(args.dir).expanduser().resolve()
+    if not d.is_dir(): sys.exit(f'estimate: {d} is not a directory')
+    entry = {'dir': str(d)}
+    if args.claude_project_dir:
+        mapped = [transcript_dir(p, args.claude_dir) for p in args.claude_project_dir]
+        for _, note in mapped:
+            if note: print(f'estimate: {note}', file=sys.stderr)
+        cp = list(dict.fromkeys(t for t, _ in mapped))
+        entry['claude_project_dir'] = cp[0] if len(cp) == 1 else cp
+    try: path = write_registry(repo, entry)
+    except OSError as err: sys.exit(f'estimate: could not write {registry_path()}: {err.strerror or err}')
+    print(f'estimate: linked {repo} -> {d} in {path}' + ('' if not is_empty(Store(d)) else
+          ' (note: it has no ledger or history yet)'))
 
 
 # ---------- install / setup ----------
@@ -3194,10 +4639,10 @@ Depends: comma-separated ids that must be done first; leave empty when unsure.
 
 
 def cmd_setup(args):
-    d = args.dir or os.environ.get('ESTIMATE_DIR'); root = git_root()
-    if not root and not d: sys.exit('estimate: not in a git repo; run setup inside your project or pass --dir')
+    root = git_root(); r = resolve(args)
+    if not r['dir']: sys.exit('estimate: not in a git repo; run setup inside your project or pass --dir')
     top = Path(root or Path.cwd())
-    store = Store(d or top / '.estimate')
+    store = Store(r['dir'])
     try: current = backlog_config(store)
     except ValueError as err: sys.exit(f'estimate: {err}')
     cfg = store.read_json('config.json') or {}
@@ -3236,6 +4681,12 @@ def cmd_setup(args):
     cfg['backlog'] = backlog
     store.write_json('config.json', cfg)
     print(f'wrote {store.dir / "config.json"}: {json.dumps(backlog)}')
+    if repo := args.repo or os.environ.get('ESTIMATE_REPO') or remote_repo():
+        entry = {**read_registry().get(repo, {}), 'dir': str(store.dir.expanduser().resolve())}
+        if r['claude_project_dir']: entry['claude_project_dir'] = r['claude_project_dir']
+        try: print(f'linked {repo} -> {entry["dir"]} in {write_registry(repo, entry)} (every worktree of {repo} finds it)')
+        except OSError as err:   # the registry is optional: setup's own config is already written
+            print(f'note: could not write {registry_path()} ({err.strerror or err}); run `estimate link --dir {entry["dir"]}` later', file=sys.stderr)
     print('next steps:\n'
           '  1. ask your agent: "estimate the backlog" (skill estimate-backlog)\n'
           + ('  2. estimate backlog pull\n  3. estimate forecast --backlog\n  4. estimate dashboard' if source == 'tiden' else
@@ -3266,6 +4717,9 @@ def main(argv=None):
     p = sub.add_parser('record', help='settle estimates from merged PRs (automatic actuals)')
     p.add_argument('--history', type=int, default=200)
     p.add_argument('--refresh', action='store_true', help='append recalculated actuals for all tracked PRs, preserving estimates')
+    p.add_argument('--no-pr-days', type=float, default=NO_PR_DAYS,
+                   help=f"mark a branch estimate 'no PR' when its branch has no PR after this many days (default {NO_PR_DAYS}; 0: never)")
+    p.add_argument('--all', action='store_true', help='every project in ~/.config/agent-estimate/projects.json, one line each')
     p.set_defaults(f=cmd_record)
     p = sub.add_parser('calibrate', help='recompute ranges per SP and per estimator from the recent window')
     p.add_argument('--since', help='ignore history before this ISO date (a process change); saved; `none` clears it')
@@ -3279,6 +4733,12 @@ def main(argv=None):
                    help='with --backlog: leave items without effort out of the totals and order, with a warning')
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--json', action='store_true'); p.set_defaults(f=cmd_forecast)
+    p = sub.add_parser('plan', help='critical-chain forecast of the backlog: waves, chain, p50/p80 dates per agent count')
+    p.add_argument('--backlog', nargs='?', const=CONFIGURED, default=CONFIGURED, metavar='FILE',
+                   help='a backlog table; default: the source in .estimate/config.json')
+    p.add_argument('--agents', type=int, default=3, help='agent count for the waves and the buffer (default 3)')
+    p.add_argument('--top', type=int, help='plan only the first N cards in Score order (their dependencies come first)')
+    p.add_argument('--seed', type=int, default=1); p.add_argument('--json', action='store_true'); p.set_defaults(f=cmd_plan)
     p = sub.add_parser('backlog', help='backlog sources: `pull` copies open Tiden cards into .estimate/backlog.md')
     bsub = p.add_subparsers(dest='backlog_cmd', required=True)
     bsub.add_parser('pull', help='read-only: open Tiden cards -> .estimate/backlog.md, keeping effort/value/depends set locally'
@@ -3295,7 +4755,14 @@ def main(argv=None):
     p.add_argument('--out'); p.add_argument('--backlog')
     p.add_argument('--offline', action='store_true', help='accepted for old scripts; the dashboard makes no network calls')
     p.add_argument('--no-burn', action='store_true', help='skip reading local Claude Code and Codex logs for the burn rows')
+    p.add_argument('--no-labels', action='store_true', help='hide session labels (the first line of a prompt) in the Usage section')
+    p.add_argument('--all', action='store_true', help='every project in ~/.config/agent-estimate/projects.json, one line each')
     p.set_defaults(f=cmd_dashboard)
+    p = sub.add_parser('usage', help='spend by repo, cache, daily trend, parallel sessions and models from every local agent log')
+    p.add_argument('--days', type=int, choices=USAGE_DAYS, default=30, help='the last N local days, today included (default 30)')
+    p.add_argument('--no-labels', action='store_true',
+                   help='hide session labels (the first line of a prompt); also `"session_labels": false` in config.json')
+    p.add_argument('--json', action='store_true'); p.set_defaults(f=cmd_usage)
     p = sub.add_parser('install', help='symlink `estimate` onto PATH and the skills into Claude Code, Codex and .agents')
     p.add_argument('--bin-dir', default='~/.local/bin'); p.add_argument('--dry-run', action='store_true'); p.set_defaults(f=cmd_install)
     p.add_argument('--statusline', action='store_true',
@@ -3305,15 +4772,21 @@ def main(argv=None):
     p = sub.add_parser('statusline-log', help='for a Claude Code status line: log plan-window %% from stdin, then run --then')
     p.add_argument('--then', metavar='COMMAND', help='your own status line command; it gets the same input')
     p.set_defaults(f=cmd_statusline_log)
+    p = sub.add_parser('doctor', help='which data dir, repo and Claude dirs are used and why; counts, gh auth, status line')
+    p.set_defaults(f=cmd_doctor)
+    p = sub.add_parser('link', help='remember the data dir for this repo (all worktrees) in ~/.config/agent-estimate/projects.json')
+    p.add_argument('--dir', default=argparse.SUPPRESS, help='the data directory')
+    p.add_argument('--repo', default=argparse.SUPPRESS, help='owner/name (default: the git remote)')
+    p.add_argument('--claude-project-dir', action='append', default=argparse.SUPPRESS,
+                   help='Claude transcript directory trusted for this repo; repeatable')
+    p.set_defaults(f=cmd_link)
     p = sub.add_parser('setup', help='ask where the backlog is and write .estimate/config.json')
     p.add_argument('--source', choices=('markdown', 'tiden')); p.add_argument('--path', help='markdown backlog file (default BACKLOG.md)')
     p.add_argument('--product-id', help='Tiden product id (optional)')
     p.add_argument('--create-backlog', action='store_true', help='create the markdown file with an empty table if it is missing')
     p.set_defaults(f=cmd_setup)
     args = ap.parse_args(argv)
-    if args.claude_project_dir is None:
-        args.claude_project_dir = [d for d in os.environ.get('ESTIMATE_CLAUDE_PROJECT_DIR', '').split(os.pathsep) if d]
-    args.f(args)
+    run_all(args) if getattr(args, 'all', False) else args.f(args)
 
 
 if __name__ == '__main__':

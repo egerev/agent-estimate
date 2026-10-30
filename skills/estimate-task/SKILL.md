@@ -10,6 +10,14 @@ grouped by who estimated them (agent + model). You never state hours, days or do
 agents are known to over-predict their own runtime several times over, and people's calendars do
 not apply to agents.
 
+## 0. Check where the data are
+
+If unsure which data the script uses (a worktree, a data dir outside the repo, a new shell), run
+`estimate doctor` first. It names the data dir, repo and Claude transcript dirs it resolved and from
+where, with the calibration n. To point it elsewhere: `--dir` (before the subcommand),
+`export ESTIMATE_DIR=...`, or once per repo `estimate link --dir <dir>` (every worktree then finds it).
+An empty data dir stops `forecast` with that message: fix the dir, do not quote numbers without one.
+
 ## 1. Size the task
 
 Pick one Fibonacci number: **1, 2, 3, 5, 8, 13**. Judge scope, uncertainty and risk the way you

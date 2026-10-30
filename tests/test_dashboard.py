@@ -101,7 +101,7 @@ class Page(unittest.TestCase):
                                   ('ag', '1', ''), ('ag', '2', ''), ('ag', '3', ' checked'), ('ag', '5', '')])  # today, 3 agents
         self.assertIn('Today<small>6 h left</small>', page)
         self.assertRegex(page, r'<span class="v t0a3"><b>(All 6 SP</b> fit|\d+ SP</b> likely done) in the rest of today with 3 agents: '
-                               r'about <b>[\d.]+ (h|min)</b> of agent work, <b>\$[\d.,]+</b>')
+                               r'about <b>[\d.]+ (h|min)</b> of agent active time, summed, <b>\$[\d.,]+</b>')
         self.assertRegex(page, r'Sure: \d+ cards? · likely: \d+ · maybe: \d+\.')
         self.assertIn('Lanes are an ideal schedule in Score order, dependencies first; review and merge waits are not drawn.', page)
         self.assertEqual(page.count('no snapshot yet'), 3)                            # plan windows need snapshots, never guessed
@@ -115,7 +115,7 @@ class Page(unittest.TestCase):
     def test_backlog_size_is_visible_next_to_the_forecast(self):
         page = self.page(items((1, 'Schema', 3, 5, ''), (2, 'UI', 2, 8, 1), (3, 'Docs', 1, 1, '')))
         self.assertIn('<small>of 3 cards</small>', page)
-        self.assertRegex(page, r'<div>All 6 SP, 1 agent</div><div><b>[\d.]+ d</b><small>[\d.]+–[\d.]+</small>')
+        self.assertRegex(page, r'<div>All 6 SP, 1 agent, wall clock</div><div><b>[\d.]+ d</b><small>[\d.]+–[\d.]+</small>')
         self.assertRegex(page, r'<div>Agent work per SP</div><div><b>[\d.]+ (h|min)</b><small>p20–p80 .* · 8 PRs</small>')
         self.assertRegex(page, r'<div>\$ per SP</div><div><b>\$[\d.]+</b><small>floor · p20–p80 .* · 8 PRs</small>')
         self.assertIn('<div>Tokens per SP</div><div><span class="no">not enough data</span>', page)  # no logged usage here
@@ -125,7 +125,7 @@ class Page(unittest.TestCase):
         page = self.page(items((1, 'a', 3, 5, '')), rows=rs)
         for label in ('Agent work per SP', '$ per SP', 'Tokens per SP'):
             self.assertIn(f'<div>{label}</div><div><span class="no">not enough data</span></div>', page)
-        self.assertNotIn('of agent work', page)
+        self.assertNotIn('of agent active time', page)
         self.assertRegex(page, r'likely done in the rest of today with 3 agents\.|All 3 SP</b> fit in the rest of today with 3 agents\.')
         nohist = self.page(items((1, 'a', 3, 5, '')), rows=[])                # no history: the hero already says why
         self.assertNotIn('not enough data', nohist)

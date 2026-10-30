@@ -157,7 +157,7 @@ class Unblocks(unittest.TestCase):
 
 class ForecastCLI(unittest.TestCase):
     def run_cli(self, d, *command):
-        out = io.StringIO()
+        out = io.StringIO(); (Path(d) / 'config.json').write_text('{}')   # a set-up data dir
         with contextlib.redirect_stdout(out):
             E.main(['--repo', 'owner/repo', '--dir', d, '--now', '2026-10-01T00:00:00Z', 'forecast', *command])
         return out.getvalue()

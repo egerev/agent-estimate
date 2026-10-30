@@ -1,17 +1,22 @@
 ---
 name: estimate-backlog
-description: Size and value every item of a backlog file (Effort in Fibonacci story points, Value, Depends), write the numbers back, and get the Score order and measured totals from the `estimate` script. Use when asked to estimate, score, prioritize or order a backlog, "оцени бэклог", or before planning several tasks. The model gives points and value only; hours and dollars come from the script.
+description: Size and value every item of a backlog file (Effort in Fibonacci story points, Value, Depends, optional Lane), write the numbers back, and get the Score order and measured totals from the `estimate` script. Use when asked to estimate, score, prioritize or order a backlog, "оцени бэклог", or before planning several tasks. The model gives points and value only; hours and dollars come from the script.
 ---
 
 # Estimate a backlog
 
-You fill three columns per item with your knowledge of the product and the code. The `estimate`
+You fill three columns per item, and a lane where one applies, with your knowledge of the product and the code. The `estimate`
 script computes Score = Value / Effort, the order, and hour and dollar totals from this repo's
 merged PRs. You never state hours, days or dollars yourself, and you do not order the list by hand.
 
 ## 1. Find the backlog
 
-Read `.estimate/config.json` at the git root, key `backlog`. The data directory may live elsewhere:
+First, if unsure which data dir the script uses, run `estimate doctor`: it prints the data dir, repo
+and Claude transcript dirs it resolved and from where (`--dir`, `$ESTIMATE_DIR`, the nearest `.estimate/`,
+or the registry entry `estimate link --dir <dir>` wrote for this repo, valid in every worktree), and the
+calibration n. An empty data dir stops `forecast` with one message; fix the dir instead of quoting n=0.
+
+Read `config.json` in that data dir (usually `.estimate/` at the git root), key `backlog`. The data directory may live elsewhere:
 if the user named one, or `$ESTIMATE_DIR` is set, read `<dir>/config.json` and pass the same
 `--dir <dir>` (and `--repo owner/name` when not run inside that repo) to every `estimate` command,
 before the subcommand: `estimate --dir <dir> --repo owner/name forecast --backlog`.
@@ -87,17 +92,35 @@ of this backlog.
 
 Judge value apart from effort; the script divides them.
 
-## 4. Depends
+## 4. Depends (required)
 
-Comma-separated ids that must be merged before this item can start. Only real ordering
-constraints, not "would be nice first". Hints:
+Fill depends for **every** item you size: comma-separated ids that must be merged before it can
+start, or `-` when it needs nothing. An empty cell means "not checked yet", and `estimate plan`
+then plans the item as if it could start now. Only real ordering constraints, not "would be nice
+first". Check each item against these:
 
 - both items touch the same files or paths, and one builds on the other's change
 - data model or migration before the UI or report that reads it
 - API or server change before the client that calls it
-- a Tiden card's "Depends on" field, or an explicit "after X" in the item text
+- a Tiden card's "Depends on" line (`backlog pull` fills an empty cell from it when it names open
+  cards; check it), or an explicit "after X" in the item text
 
-**If unsure, leave depends empty.** The script honors only what is written; it infers nothing.
+A dependency on delivered work (a merged PR, a Done card) is not a dependency: write `-`. If you
+cannot tell, write `-` and name the item to the user. The script honors only what is written; it
+infers nothing.
+
+**Lane (optional).** When several items edit the same hot file or one migration sequence, give
+them the same `lane` (a column such as `bot.py` or `migration`) and add its cap below the table:
+
+```markdown
+## Lanes
+- migration (merging cap 1): migrations number in sequence
+- bot.py (cap 1): one open PR at a time
+```
+
+`cap N` limits the lane's items started and not yet merged; `merging cap N` limits only the
+items waiting to merge. Items without a lane run in parallel. Do not invent lanes for items that
+merely live in the same area.
 
 ## 5. Write back and run
 
@@ -105,13 +128,19 @@ Write effort, value and depends into the file, then:
 
 ```sh
 estimate forecast --backlog                 # the configured backlog; or --backlog <file>; --json for scripts
+estimate plan                               # dates for 1, 2, 3, 5 agents, critical chain, waves; --agents K, --top N
 ```
 
-It prints the totals (SP, observed active hours, API-equivalent $, calendar days, each with its
+It prints the totals (SP, agent active hours, API-equivalent $, calendar days, each with its
 sample size and confidence), then the order: Score descending, and an item never before what it
 depends on. An item pushed down by a dependency shows `waits for #n`. Unknown ids and cycles
 give warnings; fix the file and rerun. An item placed before higher-Score work that depends on it
 shows `unblocks #n`. Quote the script's output; do not reorder or re-rank it.
+
+Agent hours are agent active time **summed**: one agent working serially, not wall clock. For elapsed
+time quote the `wall clock, N agents` lines (1, 2, 3, 5 agents; never shorter than the longest
+dependency chain; for 2+ agents a lower bound). The one `calibration n=…` line counts PRs left out
+of the sample; `estimate doctor` lists them.
 
 A row without effort stops the forecast. Size it. `--skip-unsized` gives partial totals that leave
 such rows out with a warning; use it only for a quick look, and say which items the totals omit.
@@ -123,3 +152,4 @@ such rows out with a warning; use it only for a quick look, and say which items 
 - Effort of 13 or more left unsplit.
 - Sizing an epic or container, or sizing work that is already merged.
 - Inventing dependencies to force an order you prefer. If the order looks wrong, recheck value.
+- Leaving depends empty on an item you sized: write the ids or `-`.

@@ -105,7 +105,7 @@ class MaybeDone(unittest.TestCase):
 
     def test_forecast_marks_and_warns_but_still_counts(self):
         with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / 'b.md'; f.write_text(self.TABLE, encoding='utf-8')
+            f = Path(d) / 'b.md'; f.write_text(self.TABLE, encoding='utf-8'); (Path(d) / 'config.json').write_text('{}')   # a set-up data dir
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 E.main(['--repo', 'o/r', '--dir', d, '--now', E.iso(T0), 'forecast', '--backlog', str(f)])

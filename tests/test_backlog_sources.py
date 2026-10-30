@@ -163,8 +163,9 @@ class Pull(unittest.TestCase):
         self.assertEqual((items[ID(3)]['depends'], items['KEY-2']['depends']), ([ID(2)], [ID(2)]))
 
     def test_cleared_depends_is_not_refilled_from_the_card(self):
-        local = f'| id | title | effort | value | depends |\n|---|---|---|---|---|\n| {ID(3)} | v | 2 | 3 | |\n'
-        self.assertEqual(E._local_fields(E.pull_tiden(SPECS, local, None, NOW, BR)[0])[ID(3)]['depends'], '')  # card says #2
+        # A cell cleared by hand is `-` (none); an empty cell is not filled yet and takes the card's Depends on line.
+        local = f'| id | title | effort | value | depends |\n|---|---|---|---|---|\n| {ID(3)} | v | 2 | 3 | - |\n'
+        self.assertEqual(E._local_fields(E.pull_tiden(SPECS, local, None, NOW, BR)[0])[ID(3)]['depends'], '-')  # card says #2
 
     def test_delivered_cards_leave_depends_and_unknown_ids_stay(self):
         local = ('| id | title | effort | value | depends |\n|---|---|---|---|---|\n'
@@ -302,7 +303,8 @@ class AtomicWrite(unittest.TestCase):
 
 class CLI(unittest.TestCase):
     def cli(self, root, *command, tiden=None, repo=True):
-        out = io.StringIO()
+        out = io.StringIO(); cfg = Path(root) / '.estimate' / 'config.json'
+        if command[0] == 'forecast' and not cfg.exists(): E.Store(cfg.parent).write_json('config.json', {})   # a set-up data dir
         with patch.object(E.subprocess, 'run', side_effect=fake_run(root, tiden)), contextlib.redirect_stdout(out):
             E.main([*(['--repo', 'owner/repo'] if repo else []), '--now', E.iso(NOW), *command])
         return out.getvalue()
